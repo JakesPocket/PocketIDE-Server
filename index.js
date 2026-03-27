@@ -2,11 +2,30 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const pty = require('node-pty');
+const { spawn } = require('child_process');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 
-const WORKSPACE = process.env.WORKSPACE || '/workspace';
+function resolveWorkspacePath() {
+  if (process.env.WORKSPACE && fs.existsSync(process.env.WORKSPACE)) {
+    return process.env.WORKSPACE;
+  }
+
+  const cwd = process.cwd();
+  const siblingPocketIDE = path.resolve(cwd, '..', 'PocketIDE');
+  if (fs.existsSync(siblingPocketIDE)) {
+    return siblingPocketIDE;
+  }
+
+  if (fs.existsSync('/workspace')) {
+    return '/workspace';
+  }
+
+  return process.cwd();
+}
+
+const WORKSPACE = resolveWorkspacePath();
 const PORT = process.env.PORT || 3000;
 
 // Change server CWD to workspace so the Copilot CLI subprocess inherits it,
@@ -59,10 +78,25 @@ async function initCopilotAgent() {
 
 const app = express();
 
-const isTrustedOrigin = (origin) =>
-  !origin ||
-  origin.includes('.app.github.dev') ||
-  origin.includes('localhost');
+function isPrivateIp(hostname) {
+  // Match common RFC1918 blocks used on local networks.
+  return /^10\./.test(hostname) || /^192\.168\./.test(hostname) || /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname);
+}
+
+const isTrustedOrigin = (origin) => {
+  if (!origin) return true;
+
+  try {
+    const { hostname } = new URL(origin);
+    if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1') return true;
+    if (hostname.endsWith('.app.github.dev')) return true;
+    if (hostname.endsWith('.local')) return true;
+    if (isPrivateIp(hostname)) return true;
+    return false;
+  } catch (_) {
+    return false;
+  }
+};
 
 const corsOptions = {
   origin: (origin, callback) =>
@@ -315,29 +349,72 @@ const io = new Server(server, {
 
 const shells = new Map();
 
+function resolveShellPath() {
+  const candidates = [process.env.SHELL, '/bin/zsh', '/bin/bash', '/bin/sh'];
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) return candidate;
+  }
+  return '/bin/sh';
+}
+
 io.on('connection', (socket) => {
   console.log(`[terminal] client connected: ${socket.id}`);
 
-  const shell = pty.spawn('/bin/bash', [], {
-    name: 'xterm-color',
-    cwd: WORKSPACE,
-    env: { ...process.env, TERM: 'xterm-color' },
-  });
+  const shellPath = resolveShellPath();
+  let shell;
+  let isPty = false;
+
+  try {
+    shell = pty.spawn(shellPath, [], {
+      name: 'xterm-color',
+      cwd: WORKSPACE,
+      env: { ...process.env, TERM: 'xterm-color' },
+    });
+    isPty = true;
+  } catch (err) {
+    console.error(`[terminal] failed to spawn shell for ${socket.id}:`, err.message);
+
+    // Fallback for environments where node-pty cannot spawn (e.g. ABI/runtime issues).
+    shell = spawn('/bin/sh', [], {
+      cwd: WORKSPACE,
+      env: { ...process.env, TERM: 'xterm-color' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    shell.on('error', (fallbackErr) => {
+      console.error(`[terminal] fallback shell failed for ${socket.id}:`, fallbackErr.message);
+      socket.emit('output', `Terminal unavailable: ${fallbackErr.message}\n`);
+    });
+
+    shell.stdout.on('data', (data) => socket.emit('output', data.toString()));
+    shell.stderr.on('data', (data) => socket.emit('output', data.toString()));
+    shell.on('exit', () => {
+      socket.emit('exit');
+      shells.delete(socket.id);
+    });
+  }
 
   shells.set(socket.id, shell);
 
-  shell.onData((data) => socket.emit('output', data.toString()));
-
-  shell.onExit(() => {
-    socket.emit('exit');
-    shells.delete(socket.id);
-  });
+  if (isPty) {
+    shell.onData((data) => socket.emit('output', data.toString()));
+    shell.onExit(() => {
+      socket.emit('exit');
+      shells.delete(socket.id);
+    });
+  }
 
   socket.on('input', (data) => {
-    if (shell.writable) shell.write(data);
+    if (isPty) {
+      if (shell.writable) shell.write(data);
+      return;
+    }
+
+    if (shell.stdin?.writable) shell.stdin.write(data);
   });
 
   socket.on('resize', (cols, rows) => {
+    if (!isPty) return;
     try { shell.resize(cols, rows); } catch (_) {}
   });
 
