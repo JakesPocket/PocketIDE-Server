@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pocketide-server
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/workspace
+      - /workspace/node_modules
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - WORKSPACE=/workspace
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - REPO_CONTEXT=${REPO_CONTEXT}
+    stdin_open: true
+    tty: true
+    restart: unless-stopped

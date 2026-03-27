@@ -1,0 +1,25 @@
+{
+  "name": "pocketide-server",
+  "version": "1.0.0",
+  "description": "Backend server for PocketIDE with GitHub Copilot SDK integration",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["pocketide", "terminal", "copilot"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@github/copilot-sdk": "^1.0.0",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "node-pty": "^1.1.0",
+    "socket.io": "^4.8.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
