@@ -27,6 +27,7 @@ function resolveWorkspacePath() {
 
 const WORKSPACE = resolveWorkspacePath();
 const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
 
 // Change server CWD to workspace so the Copilot CLI subprocess inherits it,
 // matching the same working environment as the node-pty bash shells.
@@ -39,6 +40,90 @@ try { process.chdir(WORKSPACE); } catch (_) {}
 let copilotClient = null;
 let agentSession = null;
 let agentBusy = false; // guard against concurrent sends on the same session
+
+async function createAgentSession() {
+  if (!copilotClient) {
+    throw new Error('Copilot client not initialised');
+  }
+
+  const { approveAll } = require('@github/copilot-sdk');
+
+  if (agentSession) {
+    try { await agentSession.disconnect(); } catch (_) {}
+  }
+
+  agentSession = await copilotClient.createSession({
+    model: process.env.COPILOT_MODEL || 'gpt-5',
+    streaming: true,
+    onPermissionRequest: approveAll,
+    systemMessage: {
+      content:
+        'You are an autonomous coding agent. You have permission to read/write files in /workspace and execute terminal commands to manage the repository.',
+    },
+  });
+
+  console.log(`[copilot] agent session ready — ${agentSession.sessionId}`);
+  return agentSession;
+}
+
+function shouldRecreateAgentSession(err) {
+  const message = err?.message || '';
+  return /session not found/i.test(message) || /unknown session/i.test(message);
+}
+
+async function streamAgentReply(session, prompt, sendEvent) {
+  const unsubs = [];
+
+  try {
+    unsubs.push(
+      session.on('assistant.reasoning_delta', (event) => {
+        sendEvent({ type: 'reasoning', content: event.data.deltaContent });
+      })
+    );
+
+    unsubs.push(
+      session.on('assistant.message_delta', (event) => {
+        sendEvent({ type: 'delta', content: event.data.deltaContent });
+      })
+    );
+
+    unsubs.push(
+      session.on('tool.execution_start', (event) => {
+        sendEvent({
+          type: 'tool_call',
+          tool: event.data.toolName,
+          input: event.data.toolInput ?? null,
+        });
+      })
+    );
+
+    unsubs.push(
+      session.on('tool.execution_complete', (event) => {
+        sendEvent({
+          type: 'tool_result',
+          tool: event.data.toolName,
+          output: event.data.toolOutput ?? null,
+        });
+      })
+    );
+
+    unsubs.push(
+      session.on('assistant.message', (event) => {
+        sendEvent({ type: 'message', content: event.data.content });
+      })
+    );
+
+    await new Promise((resolve, reject) => {
+      unsubs.push(
+        session.on('session.idle', () => resolve())
+      );
+
+      session.send({ prompt }).catch(reject);
+    });
+  } finally {
+    unsubs.forEach((u) => u());
+  }
+}
 
 async function initCopilotAgent() {
   try {
@@ -53,18 +138,7 @@ async function initCopilotAgent() {
     await copilotClient.start();
     console.log('[copilot] client started');
 
-    agentSession = await copilotClient.createSession({
-      model: process.env.COPILOT_MODEL || 'gpt-5',
-      streaming: true,
-      onPermissionRequest: approveAll, // approve all tool executions without prompts
-      systemMessage: {
-        // Append agent instructions while keeping SDK guardrails intact
-        content:
-          'You are an autonomous coding agent. You have permission to read/write files in /workspace and execute terminal commands to manage the repository.',
-      },
-    });
-
-    console.log(`[copilot] agent session ready — ${agentSession.sessionId}`);
+    await createAgentSession();
   } catch (err) {
     console.warn('[copilot] SDK init failed — chat endpoint disabled:', err.message);
     copilotClient = null;
@@ -154,66 +228,24 @@ app.post('/api/chat', async (req, res) => {
   };
 
   agentBusy = true;
-  const unsubs = [];
-
-  // Reasoning / thinking stream
-  unsubs.push(
-    agentSession.on('assistant.reasoning_delta', (event) => {
-      sendEvent({ type: 'reasoning', content: event.data.deltaContent });
-    })
-  );
-
-  // Text response stream
-  unsubs.push(
-    agentSession.on('assistant.message_delta', (event) => {
-      sendEvent({ type: 'delta', content: event.data.deltaContent });
-    })
-  );
-
-  // Tool call lifecycle — visible to PWA as "agent activity"
-  unsubs.push(
-    agentSession.on('tool.execution_start', (event) => {
-      sendEvent({
-        type: 'tool_call',
-        tool: event.data.toolName,
-        input: event.data.toolInput ?? null,
-      });
-    })
-  );
-
-  unsubs.push(
-    agentSession.on('tool.execution_complete', (event) => {
-      sendEvent({
-        type: 'tool_result',
-        tool: event.data.toolName,
-        output: event.data.toolOutput ?? null,
-      });
-    })
-  );
-
-  // Final complete message (always emitted regardless of streaming flag)
-  unsubs.push(
-    agentSession.on('assistant.message', (event) => {
-      sendEvent({ type: 'message', content: event.data.content });
-    })
-  );
-
   try {
-    await new Promise((resolve, reject) => {
-      // session.idle fires once the agent has finished all tool calls + response
-      unsubs.push(
-        agentSession.on('session.idle', () => resolve())
-      );
+    try {
+      await streamAgentReply(agentSession, message, sendEvent);
+    } catch (err) {
+      if (!shouldRecreateAgentSession(err)) throw err;
 
-      agentSession.send({ prompt: message }).catch(reject);
-    });
+      console.warn('[copilot] session invalid, recreating and retrying once');
+      sendEvent({ type: 'tool_call', tool: 'copilot.session.reset', input: null });
+      await createAgentSession();
+      sendEvent({ type: 'tool_result', tool: 'copilot.session.reset', output: { ok: true, sessionId: agentSession.sessionId } });
+      await streamAgentReply(agentSession, message, sendEvent);
+    }
 
     sendEvent({ type: 'done' });
   } catch (err) {
     console.error('[copilot] chat error:', err);
     sendEvent({ type: 'error', message: err.message });
   } finally {
-    unsubs.forEach((u) => u());
     agentBusy = false;
     res.end();
   }
@@ -227,17 +259,7 @@ app.post('/api/chat/reset', async (req, res) => {  if (!copilotClient) {
     return res.status(429).json({ error: 'Cannot reset while agent is busy.' });
   }
   try {
-    const { approveAll } = require('@github/copilot-sdk');
-    if (agentSession) await agentSession.disconnect();
-    agentSession = await copilotClient.createSession({
-      model: process.env.COPILOT_MODEL || 'gpt-5',
-      streaming: true,
-      onPermissionRequest: approveAll,
-      systemMessage: {
-        content:
-          'You are an autonomous coding agent. You have permission to read/write files in /workspace and execute terminal commands to manage the repository.',
-      },
-    });
+    await createAgentSession();
     console.log(`[copilot] session reset — ${agentSession.sessionId}`);
     res.json({ sessionId: agentSession.sessionId });
   } catch (err) {
@@ -457,8 +479,8 @@ process.on('SIGINT', shutdown);
 // Boot
 // =============================================================================
 
-server.listen(PORT, async () => {
-  console.log(`[server] PocketIDE Server listening on port ${PORT}`);
+server.listen(PORT, HOST, async () => {
+  console.log(`[server] PocketIDE Server listening on ${HOST}:${PORT}`);
   console.log(`[server] workspace: ${WORKSPACE}`);
   await initCopilotAgent();
 });
