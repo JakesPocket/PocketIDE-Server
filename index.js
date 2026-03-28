@@ -561,6 +561,11 @@ function getRepoCwdFromRequest(req) {
   return resolveRepoCwd(repoValue);
 }
 
+function hasExplicitRepoInRequest(req) {
+  const repoValue = req.method === 'GET' ? req.query?.repo : req.body?.repo;
+  return typeof repoValue === 'string' && repoValue.trim() !== '';
+}
+
 function parsePorcelain(raw) {
   const files = [];
   const lines = raw.split('\n');
@@ -628,6 +633,40 @@ async function getGitChangeSummary(repoCwd = WORKSPACE) {
   );
 
   return { totals, files: rows };
+}
+
+function toWorkspaceRelativePath(repoCwd, repoRelativePath) {
+  const absolutePath = path.resolve(repoCwd, repoRelativePath);
+  return path.relative(WORKSPACE, absolutePath).replace(/\\/g, '/');
+}
+
+async function getWorkspaceGitChangeSummary() {
+  const repoPaths = listWorkspaceRepos(WORKSPACE);
+  const allFiles = [];
+
+  for (const repoCwd of repoPaths) {
+    const repoId = normalizeRepoId(repoCwd);
+    const repoName = path.basename(repoCwd);
+    const summary = await getGitChangeSummary(repoCwd);
+
+    for (const file of summary.files) {
+      allFiles.push({
+        ...file,
+        path: toWorkspaceRelativePath(repoCwd, file.path),
+        repo: repoId,
+        repoName,
+      });
+    }
+  }
+
+  allFiles.sort((a, b) => a.path.localeCompare(b.path));
+
+  const totals = allFiles.reduce(
+    (acc, row) => ({ files: acc.files + 1, added: acc.added + row.added, removed: acc.removed + row.removed }),
+    { files: 0, added: 0, removed: 0 }
+  );
+
+  return { totals, files: allFiles };
 }
 
 function buildHeuristicCommitMessage(stagedFiles) {
@@ -835,8 +874,9 @@ app.get('/api/git/repos', async (req, res) => {
 // GET /api/git/changes-summary → { totals: { files, added, removed }, files: [...] }
 app.get('/api/git/changes-summary', async (req, res) => {
   try {
-    const repoCwd = getRepoCwdFromRequest(req);
-    const summary = await getGitChangeSummary(repoCwd);
+    const summary = hasExplicitRepoInRequest(req)
+      ? await getGitChangeSummary(getRepoCwdFromRequest(req))
+      : await getWorkspaceGitChangeSummary();
     res.json(summary);
   } catch (err) {
     if (err.message.includes('not a git repository') || err.message.includes('fatal:')) {
