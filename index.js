@@ -40,9 +40,32 @@ try { process.chdir(WORKSPACE); } catch (_) {}
 let copilotClient = null;
 let agentSession = null;
 let agentBusy = false; // guard against concurrent sends on the same session
+let activeCopilotAuthMode = 'unknown';
 
 function resolveGithubToken() {
   return process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.COPILOT_GITHUB_TOKEN || null;
+}
+
+function resolveCopilotAuthConfig() {
+  const mode = String(process.env.COPILOT_AUTH_MODE || 'logged-in-user').trim().toLowerCase();
+  const token = resolveGithubToken();
+
+  if (mode === 'token') {
+    if (!token) {
+      throw new Error('COPILOT_AUTH_MODE=token requires GITHUB_TOKEN (or GH_TOKEN/COPILOT_GITHUB_TOKEN).');
+    }
+    return { mode: 'token', config: { githubToken: token } };
+  }
+
+  if (mode === 'auto') {
+    if (token) {
+      return { mode: 'token', config: { githubToken: token } };
+    }
+    return { mode: 'logged-in-user', config: { useLoggedInUser: true } };
+  }
+
+  // Default is logged-in-user to better match VS Code Copilot Chat behavior.
+  return { mode: 'logged-in-user', config: { useLoggedInUser: true } };
 }
 
 async function createAgentSession() {
@@ -147,21 +170,20 @@ async function streamAgentReply(session, prompt, sendEvent) {
 async function initCopilotAgent() {
   try {
     const { CopilotClient } = require('@github/copilot-sdk');
-    const githubToken = resolveGithubToken();
+    const auth = resolveCopilotAuthConfig();
+    activeCopilotAuthMode = auth.mode;
 
-    copilotClient = new CopilotClient({
-      // Use explicit token when present, otherwise force logged-in-user auth path.
-      ...(githubToken ? { githubToken } : { useLoggedInUser: true }),
-    });
+    copilotClient = new CopilotClient(auth.config);
 
     await copilotClient.start();
-    console.log('[copilot] client started');
+    console.log(`[copilot] client started (${activeCopilotAuthMode})`);
 
     await createAgentSession();
   } catch (err) {
     console.warn('[copilot] SDK init failed — chat endpoint disabled:', err.message);
     copilotClient = null;
     agentSession = null;
+    activeCopilotAuthMode = 'unavailable';
   }
 }
 
@@ -227,7 +249,7 @@ app.post('/api/chat', async (req, res) => {
   }
 
   if (!agentSession) {
-    return res.status(503).json({ error: 'Copilot agent not initialised. Check GITHUB_TOKEN.' });
+    return res.status(503).json({ error: 'Copilot agent not initialised. Check Copilot auth/login for the selected auth mode.' });
   }
 
   if (agentBusy) {
@@ -267,7 +289,7 @@ app.post('/api/chat', async (req, res) => {
     if (/authentication info|custom provider/i.test(message)) {
       sendEvent({
         type: 'error',
-        message: 'Copilot auth is missing. Set GITHUB_TOKEN (or GH_TOKEN/COPILOT_GITHUB_TOKEN) for the PocketIDE-Server process, then restart the server.',
+        message: 'Copilot auth is missing for the current mode. If using logged-in-user, sign in to Copilot on this machine. If using token mode, set GITHUB_TOKEN (or GH_TOKEN/COPILOT_GITHUB_TOKEN) and restart the server.',
       });
     } else {
       sendEvent({ type: 'error', message });
@@ -293,6 +315,16 @@ app.post('/api/chat/reset', async (req, res) => {  if (!copilotClient) {
     console.error('[copilot] reset error:', err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// Runtime info for UI/debugging of chat provider/auth mode
+app.get('/api/chat/runtime', (req, res) => {
+  res.json({
+    provider: 'github-copilot-sdk',
+    authMode: activeCopilotAuthMode,
+    model: process.env.COPILOT_MODEL || 'gpt-5',
+    ready: Boolean(agentSession),
+  });
 });
 
 // =============================================================================
