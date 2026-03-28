@@ -592,7 +592,7 @@ app.post('/api/git/push', async (req, res) => {
 // POST /api/git/pull
 app.post('/api/git/pull', async (req, res) => {
   try {
-    const output = await runGit(['pull'], WORKSPACE);
+    const output = await runGit(['pull', '--no-rebase'], WORKSPACE);
     res.json({ ok: true, output: output.trim() });
   } catch (err) {
     res.status(500).json({ error: err.message });
