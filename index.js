@@ -443,6 +443,162 @@ app.post('/api/file', (req, res) => {
   }
 });
 
+// =============================================================================
+// Git API
+// =============================================================================
+
+function runGit(args, cwd) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('git', args, { cwd, env: process.env });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('close', (code) => {
+      if (code !== 0) reject(new Error(stderr.trim() || `git exited ${code}`));
+      else resolve(stdout);
+    });
+    proc.on('error', reject);
+  });
+}
+
+// GET /api/git/status  →  { branch, ahead, behind, staged, unstaged, untracked }
+app.get('/api/git/status', async (req, res) => {
+  try {
+    const raw = await runGit(['status', '--porcelain=v1', '-b', '--untracked-files=all'], WORKSPACE);
+    const lines = raw.split('\n');
+    const branchLine = lines[0] || '';
+
+    // Parse branch / ahead / behind from ## line
+    // e.g. "## main...origin/main [ahead 1, behind 2]"
+    const branchMatch = branchLine.match(/^## (.+?)(?:\.\.\.(\S+))?(?:\s+\[(.+?)\])?$/);
+    let branch = branchMatch ? branchMatch[1] : 'HEAD';
+    let ahead = 0;
+    let behind = 0;
+    if (branchMatch && branchMatch[3]) {
+      const aMatch = branchMatch[3].match(/ahead (\d+)/);
+      const bMatch = branchMatch[3].match(/behind (\d+)/);
+      if (aMatch) ahead = parseInt(aMatch[1], 10);
+      if (bMatch) behind = parseInt(bMatch[1], 10);
+    }
+    // Handle "No commits yet" case
+    if (branch.startsWith('No commits yet on ')) {
+      branch = branch.replace('No commits yet on ', '');
+    }
+
+    const staged = [];
+    const unstaged = [];
+    const untracked = [];
+
+    for (const line of lines.slice(1)) {
+      if (!line.trim()) continue;
+      const xy = line.slice(0, 2);
+      const file = line.slice(3).trim();
+      const x = xy[0]; // index (staged) status
+      const y = xy[1]; // worktree (unstaged) status
+
+      if (xy === '??') {
+        untracked.push({ path: file, status: '?' });
+        continue;
+      }
+      if (x !== ' ' && x !== '?') {
+        staged.push({ path: file, status: x });
+      }
+      if (y !== ' ' && y !== '?') {
+        unstaged.push({ path: file, status: y });
+      }
+    }
+
+    // Resolve repo name from git toplevel directory
+    let repoName = null;
+    try {
+      const toplevel = await runGit(['rev-parse', '--show-toplevel'], WORKSPACE);
+      repoName = path.basename(toplevel.trim());
+    } catch (_) {
+      repoName = path.basename(WORKSPACE);
+    }
+
+    res.json({ repoName, branch, ahead, behind, staged, unstaged, untracked });
+  } catch (err) {
+    // Not a git repo or no git
+    if (err.message.includes('not a git repository') || err.message.includes('fatal:')) {
+      return res.json({ repoName: null, branch: null, ahead: 0, behind: 0, staged: [], unstaged: [], untracked: [] });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/git/stage  body: { path } or { all: true }
+app.post('/api/git/stage', async (req, res) => {
+  try {
+    const { path: filePath, all } = req.body || {};
+    if (all) {
+      await runGit(['add', '-A'], WORKSPACE);
+    } else {
+      if (!filePath || typeof filePath !== 'string') return res.status(400).json({ error: 'path required' });
+      // Normalise to relative path within workspace
+      const rel = path.relative(WORKSPACE, path.resolve(WORKSPACE, filePath));
+      if (rel.startsWith('..')) return res.status(400).json({ error: 'path outside workspace' });
+      await runGit(['add', rel], WORKSPACE);
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/git/unstage  body: { path } or { all: true }
+app.post('/api/git/unstage', async (req, res) => {
+  try {
+    const { path: filePath, all } = req.body || {};
+    if (all) {
+      await runGit(['restore', '--staged', '.'], WORKSPACE);
+    } else {
+      if (!filePath || typeof filePath !== 'string') return res.status(400).json({ error: 'path required' });
+      const rel = path.relative(WORKSPACE, path.resolve(WORKSPACE, filePath));
+      if (rel.startsWith('..')) return res.status(400).json({ error: 'path outside workspace' });
+      await runGit(['restore', '--staged', rel], WORKSPACE);
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/git/commit  body: { message }
+app.post('/api/git/commit', async (req, res) => {
+  try {
+    const { message } = req.body || {};
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      return res.status(400).json({ error: 'commit message required' });
+    }
+    const output = await runGit(['commit', '-m', message.trim()], WORKSPACE);
+    res.json({ ok: true, output: output.trim() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/git/push  body: {} (pushes current branch to its tracking remote)
+app.post('/api/git/push', async (req, res) => {
+  try {
+    const output = await runGit(['push'], WORKSPACE);
+    res.json({ ok: true, output: output.trim() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/git/pull
+app.post('/api/git/pull', async (req, res) => {
+  try {
+    const output = await runGit(['pull'], WORKSPACE);
+    res.json({ ok: true, output: output.trim() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({
