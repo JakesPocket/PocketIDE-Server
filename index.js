@@ -25,7 +25,7 @@ function resolveWorkspacePath() {
   return process.cwd();
 }
 
-const WORKSPACE = resolveWorkspacePath();
+let WORKSPACE = resolveWorkspacePath();
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 
@@ -269,6 +269,75 @@ app.post('/api/chat/reset', async (req, res) => {  if (!copilotClient) {
 });
 
 // =============================================================================
+// GET /api/workspace  — return the current workspace path
+// POST /api/workspace — change the workspace path at runtime
+// =============================================================================
+
+app.get('/api/workspace', (req, res) => {
+  res.json({ path: WORKSPACE });
+});
+
+app.post('/api/workspace', (req, res) => {
+  const newPath = req.body?.path;
+  if (!newPath || typeof newPath !== 'string') {
+    return res.status(400).json({ error: 'path required' });
+  }
+
+  const resolved = path.resolve(newPath);
+  if (!fs.existsSync(resolved)) {
+    return res.status(404).json({ error: 'Path does not exist' });
+  }
+
+  let stat;
+  try { stat = fs.statSync(resolved); } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+  if (!stat.isDirectory()) {
+    return res.status(400).json({ error: 'Path must be a directory' });
+  }
+
+  WORKSPACE = resolved;
+  try { process.chdir(WORKSPACE); } catch (_) {}
+  console.log(`[workspace] changed to ${WORKSPACE}`);
+  res.json({ path: WORKSPACE });
+});
+
+// =============================================================================
+// GET /api/workspace/suggestions?prefix=<path-prefix>
+// Returns matching directories for autocomplete in Settings.
+// =============================================================================
+
+app.get('/api/workspace/suggestions', (req, res) => {
+  const rawPrefix = typeof req.query.prefix === 'string' ? req.query.prefix : '';
+  const prefix = rawPrefix.trim();
+
+  const normalized = prefix.length ? path.normalize(prefix) : '/';
+  const hasTrailingSep = normalized.endsWith(path.sep);
+  const baseDir = hasTrailingSep ? normalized : path.dirname(normalized);
+  const partialName = hasTrailingSep ? '' : path.basename(normalized);
+
+  let entries;
+  try {
+    entries = fs.readdirSync(baseDir, { withFileTypes: true });
+  } catch (_) {
+    return res.json({ suggestions: [] });
+  }
+
+  const suggestions = entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .filter((name) => !name.startsWith('.') && name.toLowerCase().startsWith(partialName.toLowerCase()))
+    .sort((a, b) => a.localeCompare(b))
+    .slice(0, 20)
+    .map((name) => {
+      const full = path.join(baseDir, name);
+      return full.endsWith(path.sep) ? full : `${full}${path.sep}`;
+    });
+
+  res.json({ suggestions });
+});
+
+// =============================================================================
 // GET /api/files — return a recursive directory tree of WORKSPACE
 // =============================================================================
 
@@ -334,6 +403,41 @@ app.get('/api/file', (req, res) => {
   try {
     const content = fs.readFileSync(abs, 'utf8');
     res.type('text/plain').send(content);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =============================================================================
+// POST /api/file — save raw text content to a single file inside WORKSPACE
+// Body: { path: '/relative/path', content: '...' }
+// =============================================================================
+
+app.post('/api/file', (req, res) => {
+  const relPath = req.body?.path;
+  const content = req.body?.content;
+
+  if (!relPath || typeof relPath !== 'string') {
+    return res.status(400).json({ error: 'path is required' });
+  }
+  if (typeof content !== 'string') {
+    return res.status(400).json({ error: 'content must be a string' });
+  }
+
+  const abs = path.resolve(WORKSPACE, relPath.replace(/^\//, ''));
+  if (!abs.startsWith(path.resolve(WORKSPACE))) {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+
+  let stat;
+  try { stat = fs.statSync(abs); } catch {
+    return res.status(404).json({ error: 'File not found' });
+  }
+  if (!stat.isFile()) return res.status(400).json({ error: 'Not a file' });
+
+  try {
+    fs.writeFileSync(abs, content, 'utf8');
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -428,7 +532,7 @@ io.on('connection', (socket) => {
 
   socket.on('input', (data) => {
     if (isPty) {
-      if (shell.writable) shell.write(data);
+      try { shell.write(data); } catch (_) {}
       return;
     }
 

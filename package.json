@@ -9,7 +9,11 @@
     "dev": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": ["pocketide", "terminal", "copilot"],
+  "keywords": [
+    "pocketide",
+    "terminal",
+    "copilot"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
