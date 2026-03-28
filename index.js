@@ -41,6 +41,10 @@ let copilotClient = null;
 let agentSession = null;
 let agentBusy = false; // guard against concurrent sends on the same session
 
+function resolveGithubToken() {
+  return process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.COPILOT_GITHUB_TOKEN || null;
+}
+
 async function createAgentSession() {
   if (!copilotClient) {
     throw new Error('Copilot client not initialised');
@@ -73,53 +77,68 @@ function shouldRecreateAgentSession(err) {
 
 async function streamAgentReply(session, prompt, sendEvent) {
   const unsubs = [];
+  let sawAssistantText = false;
+  let lastAssistantMessage = '';
+  let sessionError = null;
 
   try {
-    unsubs.push(
-      session.on('assistant.reasoning_delta', (event) => {
-        sendEvent({ type: 'reasoning', content: event.data.deltaContent });
-      })
-    );
+    unsubs.push(session.on((event) => {
+      const type = event?.type;
+      const data = event?.data || {};
 
-    unsubs.push(
-      session.on('assistant.message_delta', (event) => {
-        sendEvent({ type: 'delta', content: event.data.deltaContent });
-      })
-    );
+      if (type === 'assistant.reasoning_delta' && typeof data.deltaContent === 'string' && data.deltaContent) {
+        sendEvent({ type: 'reasoning', content: data.deltaContent });
+        return;
+      }
 
-    unsubs.push(
-      session.on('tool.execution_start', (event) => {
+      if (type === 'assistant.message_delta' && typeof data.deltaContent === 'string' && data.deltaContent) {
+        sawAssistantText = true;
+        sendEvent({ type: 'delta', content: data.deltaContent });
+        return;
+      }
+
+      if (type === 'assistant.message') {
+        const content = typeof data.content === 'string' ? data.content : '';
+        if (content) {
+          sawAssistantText = true;
+          lastAssistantMessage = content;
+          sendEvent({ type: 'message', content });
+        }
+        return;
+      }
+
+      if (type === 'tool.execution_start') {
         sendEvent({
           type: 'tool_call',
-          tool: event.data.toolName,
-          input: event.data.toolInput ?? null,
+          tool: data.toolName || 'unknown_tool',
+          input: data.arguments ?? null,
         });
-      })
-    );
+        return;
+      }
 
-    unsubs.push(
-      session.on('tool.execution_complete', (event) => {
+      if (type === 'tool.execution_complete') {
         sendEvent({
           type: 'tool_result',
-          tool: event.data.toolName,
-          output: event.data.toolOutput ?? null,
+          tool: data.toolName || 'unknown_tool',
+          output: data.result ?? data.error ?? null,
         });
-      })
-    );
+        return;
+      }
 
-    unsubs.push(
-      session.on('assistant.message', (event) => {
-        sendEvent({ type: 'message', content: event.data.content });
-      })
-    );
+      if (type === 'session.error') {
+        sessionError = new Error(data.message || 'Session error');
+      }
+    }));
 
-    await new Promise((resolve, reject) => {
-      unsubs.push(
-        session.on('session.idle', () => resolve())
-      );
+    const finalEvent = await session.sendAndWait({ prompt }, 120000);
+    if (sessionError) throw sessionError;
+    const finalContent = typeof finalEvent?.data?.content === 'string' ? finalEvent.data.content : '';
 
-      session.send({ prompt }).catch(reject);
-    });
+    if (!sawAssistantText && finalContent) {
+      sendEvent({ type: 'message', content: finalContent });
+    } else if (!sawAssistantText && lastAssistantMessage) {
+      sendEvent({ type: 'message', content: lastAssistantMessage });
+    }
   } finally {
     unsubs.forEach((u) => u());
   }
@@ -127,12 +146,12 @@ async function streamAgentReply(session, prompt, sendEvent) {
 
 async function initCopilotAgent() {
   try {
-    const { CopilotClient, approveAll } = require('@github/copilot-sdk');
+    const { CopilotClient } = require('@github/copilot-sdk');
+    const githubToken = resolveGithubToken();
 
     copilotClient = new CopilotClient({
-      // Picks up GITHUB_TOKEN / GH_TOKEN / COPILOT_GITHUB_TOKEN automatically;
-      // explicit assignment gives it priority over cached CLI credentials.
-      ...(process.env.GITHUB_TOKEN && { githubToken: process.env.GITHUB_TOKEN }),
+      // Use explicit token when present, otherwise force logged-in-user auth path.
+      ...(githubToken ? { githubToken } : { useLoggedInUser: true }),
     });
 
     await copilotClient.start();
@@ -244,7 +263,15 @@ app.post('/api/chat', async (req, res) => {
     sendEvent({ type: 'done' });
   } catch (err) {
     console.error('[copilot] chat error:', err);
-    sendEvent({ type: 'error', message: err.message });
+    const message = err?.message || 'Unknown chat error';
+    if (/authentication info|custom provider/i.test(message)) {
+      sendEvent({
+        type: 'error',
+        message: 'Copilot auth is missing. Set GITHUB_TOKEN (or GH_TOKEN/COPILOT_GITHUB_TOKEN) for the PocketIDE-Server process, then restart the server.',
+      });
+    } else {
+      sendEvent({ type: 'error', message });
+    }
   } finally {
     agentBusy = false;
     res.end();
@@ -462,10 +489,272 @@ function runGit(args, cwd) {
   });
 }
 
+function isGitRepo(dirPath) {
+  return fs.existsSync(path.join(dirPath, '.git'));
+}
+
+function listWorkspaceRepos(rootPath) {
+  const repos = [];
+  const seen = new Set();
+  const queue = [{ dir: rootPath, depth: 0 }];
+  const MAX_DEPTH = 4;
+  const SKIP_DIRS = new Set(['.git', 'node_modules', 'dist', 'build', '.next']);
+
+  while (queue.length) {
+    const { dir, depth } = queue.shift();
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+
+    if (isGitRepo(dir)) {
+      repos.push(dir);
+      // Do not recurse into nested folders of a repo; treat each repo root as its own boundary.
+      continue;
+    }
+
+    if (depth >= MAX_DEPTH) continue;
+
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (_) {
+      entries = [];
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (SKIP_DIRS.has(entry.name)) continue;
+      if (entry.name.startsWith('.')) continue;
+      queue.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
+    }
+  }
+
+  return repos.sort((a, b) => a.localeCompare(b));
+}
+
+function normalizeRepoId(repoCwd) {
+  const rel = path.relative(WORKSPACE, repoCwd).replace(/\\/g, '/');
+  return rel && rel !== '' ? rel : '.';
+}
+
+function resolveRepoCwd(repoValue) {
+  if (!repoValue || typeof repoValue !== 'string' || !repoValue.trim()) {
+    return WORKSPACE;
+  }
+
+  const raw = repoValue.trim();
+  const abs = raw === '.' ? WORKSPACE : path.resolve(WORKSPACE, raw);
+  const root = path.resolve(WORKSPACE);
+
+  if (!(abs === root || abs.startsWith(`${root}${path.sep}`))) {
+    throw new Error('repo outside workspace');
+  }
+
+  if (!isGitRepo(abs)) {
+    throw new Error('repo is not a git repository');
+  }
+
+  return abs;
+}
+
+function getRepoCwdFromRequest(req) {
+  const repoValue = req.method === 'GET' ? req.query?.repo : req.body?.repo;
+  return resolveRepoCwd(repoValue);
+}
+
+function parsePorcelain(raw) {
+  const files = [];
+  const lines = raw.split('\n');
+  for (const line of lines.slice(1)) {
+    if (!line.trim()) continue;
+    const xy = line.slice(0, 2);
+    const file = line.slice(3).trim();
+    const x = xy[0];
+    const y = xy[1];
+
+    if (xy === '??') {
+      files.push({ path: file, status: '?', staged: false, unstaged: true, untracked: true });
+      continue;
+    }
+
+    files.push({
+      path: file,
+      status: x !== ' ' && x !== '?' ? x : y,
+      staged: x !== ' ' && x !== '?',
+      unstaged: y !== ' ' && y !== '?',
+      untracked: false,
+    });
+  }
+  return files;
+}
+
+function parseNumstat(raw) {
+  const map = new Map();
+  const lines = raw.split('\n').filter(Boolean);
+  for (const line of lines) {
+    const parts = line.split('\t');
+    if (parts.length < 3) continue;
+    const added = parts[0] === '-' ? 0 : parseInt(parts[0], 10) || 0;
+    const removed = parts[1] === '-' ? 0 : parseInt(parts[1], 10) || 0;
+    const file = parts.slice(2).join('\t').trim();
+    map.set(file, { added, removed });
+  }
+  return map;
+}
+
+async function getGitChangeSummary(repoCwd = WORKSPACE) {
+  const statusRaw = await runGit(['status', '--porcelain=v1', '-b', '--untracked-files=all'], repoCwd);
+  const files = parsePorcelain(statusRaw);
+
+  const numstatHead = parseNumstat(await runGit(['diff', '--numstat', 'HEAD'], repoCwd));
+  const byPath = new Map();
+
+  for (const file of files) {
+    const stat = numstatHead.get(file.path) || { added: 0, removed: 0 };
+    byPath.set(file.path, {
+      path: file.path,
+      status: file.status,
+      added: stat.added,
+      removed: stat.removed,
+      staged: file.staged,
+      unstaged: file.unstaged,
+      untracked: file.untracked,
+    });
+  }
+
+  const rows = [...byPath.values()].sort((a, b) => a.path.localeCompare(b.path));
+  const totals = rows.reduce(
+    (acc, row) => ({ files: acc.files + 1, added: acc.added + row.added, removed: acc.removed + row.removed }),
+    { files: 0, added: 0, removed: 0 }
+  );
+
+  return { totals, files: rows };
+}
+
+function buildHeuristicCommitMessage(stagedFiles) {
+  const names = stagedFiles.map((f) => path.basename(f.path));
+  if (names.length === 1) {
+    return `update ${names[0]}`;
+  }
+  if (names.length === 2) {
+    return `update ${names[0]} and ${names[1]}`;
+  }
+  const preview = names.slice(0, 2).join(', ');
+  return `update ${names.length} files (${preview}...)`;
+}
+
+function extractSingleLineMessage(content) {
+  if (!content || typeof content !== 'string') return '';
+  const cleaned = content
+    .replace(/```[\s\S]*?```/g, '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const firstLine = cleaned[0] || '';
+  return firstLine.replace(/^[-*]\s+/, '').replace(/^"|"$/g, '').trim();
+}
+
+function buildCommitMessagePrompt(stagedFiles) {
+  const summaryLines = stagedFiles
+    .slice(0, 50)
+    .map((f) => `- ${f.path} (${f.status || 'modified'})`)
+    .join('\n');
+
+  return [
+    'Write a single Git commit message for these staged changes.',
+    'Rules:',
+    '- Return exactly one line of plain text.',
+    '- Use imperative mood.',
+    '- Max 72 characters.',
+    '- No quotes, no markdown, no code fences.',
+    '',
+    'Staged files:',
+    summaryLines || '- (none)',
+  ].join('\n');
+}
+
+async function generateAiCommitMessage(stagedFiles) {
+  if (!copilotClient) {
+    throw new Error('Copilot client not available. Start server with valid auth first.');
+  }
+
+  const { approveAll } = require('@github/copilot-sdk');
+  const oneShotSession = await copilotClient.createSession({
+    model: process.env.COPILOT_MODEL || 'gpt-5',
+    streaming: false,
+    onPermissionRequest: approveAll,
+    systemMessage: {
+      content: 'You are a concise Git commit message assistant.',
+    },
+  });
+
+  try {
+    const result = await oneShotSession.sendAndWait({
+      prompt: buildCommitMessagePrompt(stagedFiles),
+    }, 120000);
+
+    const message = extractSingleLineMessage(result?.data?.content || '');
+    if (!message) {
+      throw new Error('AI returned an empty commit message.');
+    }
+
+    return message;
+  } finally {
+    try { await oneShotSession.disconnect(); } catch (_) {}
+  }
+}
+
+function hasLocalChangesFromStatus(statusRaw) {
+  const lines = statusRaw.split('\n').slice(1);
+  return lines.some((line) => Boolean(line.trim()));
+}
+
+async function localBranchExists(localName, repoCwd) {
+  try {
+    await runGit(['show-ref', '--verify', '--quiet', `refs/heads/${localName}`], repoCwd);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function resolveCheckoutArgs(branch, remote, force, repoCwd) {
+  if (!remote) {
+    return ['checkout', ...(force ? ['--force'] : []), branch];
+  }
+
+  const localName = branch.replace(/^[^/]+\//, '').trim();
+  if (!localName || localName === branch) {
+    throw new Error('Invalid remote branch name');
+  }
+
+  const exists = await localBranchExists(localName, repoCwd);
+  if (exists) {
+    return ['checkout', ...(force ? ['--force'] : []), localName];
+  }
+
+  return ['checkout', ...(force ? ['--force'] : []), '-b', localName, '--track', branch];
+}
+
+function resolveWorkspaceRelativePath(inputPath) {
+  const normalized = String(inputPath || '').replace(/^\/+/, '');
+  const abs = path.resolve(WORKSPACE, normalized);
+  const root = path.resolve(WORKSPACE);
+  if (!(abs === root || abs.startsWith(`${root}${path.sep}`))) {
+    throw new Error('path outside workspace');
+  }
+  const rel = path.relative(root, abs).replace(/\\/g, '/');
+  if (!rel || rel.startsWith('..')) {
+    throw new Error('invalid path');
+  }
+  return rel;
+}
+
 // GET /api/git/status  →  { branch, ahead, behind, staged, unstaged, untracked }
 app.get('/api/git/status', async (req, res) => {
   try {
-    const raw = await runGit(['status', '--porcelain=v1', '-b', '--untracked-files=all'], WORKSPACE);
+    const repoCwd = getRepoCwdFromRequest(req);
+    const raw = await runGit(['status', '--porcelain=v1', '-b', '--untracked-files=all'], repoCwd);
     const lines = raw.split('\n');
     const branchLine = lines[0] || '';
 
@@ -512,13 +801,13 @@ app.get('/api/git/status', async (req, res) => {
     // Resolve repo name from git toplevel directory
     let repoName = null;
     try {
-      const toplevel = await runGit(['rev-parse', '--show-toplevel'], WORKSPACE);
+      const toplevel = await runGit(['rev-parse', '--show-toplevel'], repoCwd);
       repoName = path.basename(toplevel.trim());
     } catch (_) {
-      repoName = path.basename(WORKSPACE);
+      repoName = path.basename(repoCwd);
     }
 
-    res.json({ repoName, branch, ahead, behind, staged, unstaged, untracked });
+    res.json({ repo: normalizeRepoId(repoCwd), repoName, branch, ahead, behind, staged, unstaged, untracked });
   } catch (err) {
     // Not a git repo or no git
     if (err.message.includes('not a git repository') || err.message.includes('fatal:')) {
@@ -528,18 +817,100 @@ app.get('/api/git/status', async (req, res) => {
   }
 });
 
+// GET /api/git/repos → { repos: [{ id, name, path }] }
+app.get('/api/git/repos', async (req, res) => {
+  try {
+    const repoPaths = listWorkspaceRepos(WORKSPACE);
+    const repos = repoPaths.map((repoPath) => ({
+      id: normalizeRepoId(repoPath),
+      name: path.basename(repoPath),
+      path: repoPath,
+    }));
+    res.json({ repos });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/git/changes-summary → { totals: { files, added, removed }, files: [...] }
+app.get('/api/git/changes-summary', async (req, res) => {
+  try {
+    const repoCwd = getRepoCwdFromRequest(req);
+    const summary = await getGitChangeSummary(repoCwd);
+    res.json(summary);
+  } catch (err) {
+    if (err.message.includes('not a git repository') || err.message.includes('fatal:')) {
+      return res.json({ totals: { files: 0, added: 0, removed: 0 }, files: [] });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/git/branches → { branches: [{ name, fullName, current, upstream, remote }] }
+app.get('/api/git/branches', async (req, res) => {
+  try {
+    const repoCwd = getRepoCwdFromRequest(req);
+    const localRaw = await runGit(['branch', '--format=%(refname:short)%09%(HEAD)%09%(upstream:short)'], repoCwd);
+    const localBranches = localRaw
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const [name = '', head = '', upstream = ''] = line.split('\t');
+        return {
+          name: name.trim(),
+          fullName: name.trim(),
+          current: head.trim() === '*',
+          upstream: upstream.trim() || null,
+          remote: false,
+        };
+      });
+
+    const remoteRaw = await runGit(['branch', '-r', '--format=%(refname:short)'], repoCwd);
+    const remoteBranches = remoteRaw
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .filter((name) => name.includes('/'))
+      .filter((name) => !/\/HEAD$/.test(name))
+      .map((name) => ({
+        name,
+        fullName: name,
+        current: false,
+        upstream: null,
+        remote: true,
+      }));
+
+    const branches = [
+      ...localBranches.sort((a, b) => {
+        if (a.current !== b.current) return a.current ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      }),
+      ...remoteBranches.sort((a, b) => a.name.localeCompare(b.name)),
+    ];
+
+    res.json({ repo: normalizeRepoId(repoCwd), branches });
+  } catch (err) {
+    if (err.message.includes('not a git repository') || err.message.includes('fatal:')) {
+      return res.json({ branches: [] });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /api/git/stage  body: { path } or { all: true }
 app.post('/api/git/stage', async (req, res) => {
   try {
+    const repoCwd = getRepoCwdFromRequest(req);
     const { path: filePath, all } = req.body || {};
     if (all) {
-      await runGit(['add', '-A'], WORKSPACE);
+      await runGit(['add', '-A'], repoCwd);
     } else {
       if (!filePath || typeof filePath !== 'string') return res.status(400).json({ error: 'path required' });
       // Normalise to relative path within workspace
-      const rel = path.relative(WORKSPACE, path.resolve(WORKSPACE, filePath));
+      const rel = path.relative(repoCwd, path.resolve(repoCwd, filePath));
       if (rel.startsWith('..')) return res.status(400).json({ error: 'path outside workspace' });
-      await runGit(['add', rel], WORKSPACE);
+      await runGit(['add', rel], repoCwd);
     }
     res.json({ ok: true });
   } catch (err) {
@@ -550,14 +921,15 @@ app.post('/api/git/stage', async (req, res) => {
 // POST /api/git/unstage  body: { path } or { all: true }
 app.post('/api/git/unstage', async (req, res) => {
   try {
+    const repoCwd = getRepoCwdFromRequest(req);
     const { path: filePath, all } = req.body || {};
     if (all) {
-      await runGit(['restore', '--staged', '.'], WORKSPACE);
+      await runGit(['restore', '--staged', '.'], repoCwd);
     } else {
       if (!filePath || typeof filePath !== 'string') return res.status(400).json({ error: 'path required' });
-      const rel = path.relative(WORKSPACE, path.resolve(WORKSPACE, filePath));
+      const rel = path.relative(repoCwd, path.resolve(repoCwd, filePath));
       if (rel.startsWith('..')) return res.status(400).json({ error: 'path outside workspace' });
-      await runGit(['restore', '--staged', rel], WORKSPACE);
+      await runGit(['restore', '--staged', rel], repoCwd);
     }
     res.json({ ok: true });
   } catch (err) {
@@ -568,12 +940,167 @@ app.post('/api/git/unstage', async (req, res) => {
 // POST /api/git/commit  body: { message }
 app.post('/api/git/commit', async (req, res) => {
   try {
+    const repoCwd = getRepoCwdFromRequest(req);
     const { message } = req.body || {};
     if (!message || typeof message !== 'string' || !message.trim()) {
       return res.status(400).json({ error: 'commit message required' });
     }
-    const output = await runGit(['commit', '-m', message.trim()], WORKSPACE);
+    const output = await runGit(['commit', '-m', message.trim()], repoCwd);
     res.json({ ok: true, output: output.trim() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/git/generate-commit-message → { message, source }
+app.post('/api/git/generate-commit-message', async (req, res) => {
+  try {
+    const repoCwd = getRepoCwdFromRequest(req);
+    const statusRaw = await runGit(['status', '--porcelain=v1', '-b', '--untracked-files=all'], repoCwd);
+    const files = parsePorcelain(statusRaw);
+    const stagedFiles = files.filter((f) => f.staged);
+
+    if (stagedFiles.length === 0) {
+      return res.status(400).json({ error: 'No staged files. Stage files first to generate a commit message.' });
+    }
+
+    const message = await generateAiCommitMessage(stagedFiles);
+    res.json({ message, source: 'ai' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/git/checkout  body: { branch, strategy?: 'stash' | 'force' }
+app.post('/api/git/checkout', async (req, res) => {
+  try {
+    const repoCwd = getRepoCwdFromRequest(req);
+    const branch = typeof req.body?.branch === 'string' ? req.body.branch.trim() : '';
+    const strategy = typeof req.body?.strategy === 'string' ? req.body.strategy : null;
+    const remote = Boolean(req.body?.remote);
+
+    if (!branch) {
+      return res.status(400).json({ error: 'branch required' });
+    }
+    if (strategy && !['stash', 'force'].includes(strategy)) {
+      return res.status(400).json({ error: 'strategy must be stash or force' });
+    }
+
+    const statusRaw = await runGit(['status', '--porcelain=v1', '-b', '--untracked-files=all'], repoCwd);
+    const hasChanges = hasLocalChangesFromStatus(statusRaw);
+
+    if (!strategy && hasChanges) {
+      return res.status(409).json({
+        conflict: true,
+        error: 'You have uncommitted changes. Choose stash or force to switch branches.',
+      });
+    }
+
+    if (strategy === 'force') {
+      const checkoutArgs = await resolveCheckoutArgs(branch, remote, true, repoCwd);
+      const output = await runGit(checkoutArgs, repoCwd);
+      return res.json({ ok: true, output: output.trim() });
+    }
+
+    if (strategy === 'stash') {
+      const stashMessage = `pocketide:auto-stash:${new Date().toISOString()}`;
+      const stashOutput = await runGit(['stash', 'push', '-u', '-m', stashMessage], repoCwd);
+      const checkoutArgs = await resolveCheckoutArgs(branch, remote, false, repoCwd);
+      const output = await runGit(checkoutArgs, repoCwd);
+
+      if (!/No local changes to save/i.test(stashOutput)) {
+        try {
+          await runGit(['stash', 'pop'], repoCwd);
+        } catch (popErr) {
+          return res.json({
+            ok: true,
+            output: output.trim(),
+            warning: `Switched branches, but stash pop had conflicts: ${popErr.message}`,
+          });
+        }
+      }
+
+      return res.json({ ok: true, output: output.trim() });
+    }
+
+    const checkoutArgs = await resolveCheckoutArgs(branch, remote, false, repoCwd);
+    const output = await runGit(checkoutArgs, repoCwd);
+    res.json({ ok: true, output: output.trim() });
+  } catch (err) {
+    if (/would be overwritten|Your local changes/i.test(err.message || '')) {
+      return res.status(409).json({
+        conflict: true,
+        error: err.message,
+      });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/git/branch/create  body: { name, from?, repo }
+app.post('/api/git/branch/create', async (req, res) => {
+  try {
+    const repoCwd = getRepoCwdFromRequest(req);
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const from = typeof req.body?.from === 'string' ? req.body.from.trim() : '';
+
+    if (!name) {
+      return res.status(400).json({ error: 'Branch name is required.' });
+    }
+    if (/\s/.test(name)) {
+      return res.status(400).json({ error: 'Branch name cannot contain spaces.' });
+    }
+
+    const exists = await localBranchExists(name, repoCwd);
+    if (exists) {
+      return res.status(400).json({ error: `Branch ${name} already exists.` });
+    }
+
+    const args = from
+      ? (/^origin\//.test(from)
+          ? ['checkout', '-b', name, '--track', from]
+          : ['checkout', '-b', name, from])
+      : ['checkout', '-b', name];
+
+    const output = await runGit(args, repoCwd);
+    res.json({ ok: true, output: output.trim(), branch: name });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/git/discard-changes  body: { paths: ["src/file.js", ...] }
+app.post('/api/git/discard-changes', async (req, res) => {
+  try {
+    const paths = req.body?.paths;
+    if (!Array.isArray(paths)) {
+      return res.status(400).json({ error: 'paths must be an array' });
+    }
+
+    const relPaths = [];
+    for (const filePath of paths) {
+      if (typeof filePath !== 'string' || !filePath.trim()) {
+        return res.status(400).json({ error: 'each path must be a non-empty string' });
+      }
+      relPaths.push(resolveWorkspaceRelativePath(filePath.trim()));
+    }
+
+    for (const relPath of relPaths) {
+      let isTracked = true;
+      try {
+        await runGit(['ls-files', '--error-unmatch', '--', relPath], WORKSPACE);
+      } catch (_) {
+        isTracked = false;
+      }
+
+      if (isTracked) {
+        await runGit(['restore', '--staged', '--worktree', '--', relPath], WORKSPACE);
+      } else {
+        fs.rmSync(path.resolve(WORKSPACE, relPath), { recursive: true, force: true });
+      }
+    }
+
+    res.json({ ok: true, reverted: relPaths.length, paths: relPaths });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -582,7 +1109,8 @@ app.post('/api/git/commit', async (req, res) => {
 // POST /api/git/push  body: {} (pushes current branch to its tracking remote)
 app.post('/api/git/push', async (req, res) => {
   try {
-    const output = await runGit(['push'], WORKSPACE);
+    const repoCwd = getRepoCwdFromRequest(req);
+    const output = await runGit(['push'], repoCwd);
     res.json({ ok: true, output: output.trim() });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -592,7 +1120,8 @@ app.post('/api/git/push', async (req, res) => {
 // POST /api/git/pull
 app.post('/api/git/pull', async (req, res) => {
   try {
-    const output = await runGit(['pull', '--no-rebase'], WORKSPACE);
+    const repoCwd = getRepoCwdFromRequest(req);
+    const output = await runGit(['pull', '--no-rebase'], repoCwd);
     res.json({ ok: true, output: output.trim() });
   } catch (err) {
     res.status(500).json({ error: err.message });
