@@ -6,6 +6,7 @@ const { spawn } = require('child_process');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 function resolveWorkspacePath() {
   if (process.env.WORKSPACE && fs.existsSync(process.env.WORKSPACE)) {
@@ -26,8 +27,16 @@ function resolveWorkspacePath() {
 }
 
 let WORKSPACE = resolveWorkspacePath();
+
+// In-memory snapshot of file contents captured at each "Keep" action.
+// Maps workspace-relative path → file content string.
+const keepSnapshots = new Map();
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
+const TWO_MINUTES_MS = 2 * 60 * 1000;
+const TOOL_STEP_TIMEOUT_MS = 45 * 1000;
+const MAX_CONSECUTIVE_IDENTICAL_STEPS = 8;
+const MAX_TOOL_EXECUTIONS_PER_SIGNATURE = 14;
 
 // Change server CWD to workspace so the Copilot CLI subprocess inherits it,
 // matching the same working environment as the node-pty bash shells.
@@ -98,13 +107,46 @@ function shouldRecreateAgentSession(err) {
   return /session not found/i.test(message) || /unknown session/i.test(message);
 }
 
-async function streamAgentReply(session, prompt, sendEvent) {
+async function streamAgentReply(session, prompt, sendEvent, mode = 'agent') {
   const unsubs = [];
   let sawAssistantText = false;
   let lastAssistantMessage = '';
   let sessionError = null;
+  let watchdogId = null;
+  let activeStep = null;
+  let lastStepSignature = '';
+  let consecutiveStepCount = 0;
+  const stepExecutionCounts = new Map();
+
+  function serializeStepInput(input) {
+    if (input == null) return 'null';
+    if (typeof input === 'string') return input.slice(0, 180);
+    try {
+      return JSON.stringify(input).slice(0, 180);
+    } catch (_) {
+      return String(input).slice(0, 180);
+    }
+  }
+
+  function abortSessionRun(reason, metadata = {}) {
+    if (sessionError) return;
+    sessionError = new Error(reason);
+    sessionError.metadata = metadata;
+    try {
+      Promise.resolve(session.disconnect()).catch(() => {});
+    } catch (_) {}
+  }
 
   try {
+    watchdogId = setInterval(() => {
+      if (!activeStep || sessionError) return;
+      const elapsedMs = Date.now() - activeStep.startedAt;
+      if (elapsedMs <= TOOL_STEP_TIMEOUT_MS) return;
+      abortSessionRun(
+        `Step timeout: ${activeStep.tool} ran for ${Math.round(elapsedMs / 1000)}s (limit ${Math.round(TOOL_STEP_TIMEOUT_MS / 1000)}s).`
+      );
+    }, 1000);
+
     unsubs.push(session.on((event) => {
       const type = event?.type;
       const data = event?.data || {};
@@ -131,15 +173,51 @@ async function streamAgentReply(session, prompt, sendEvent) {
       }
 
       if (type === 'tool.execution_start') {
+        const tool = data.toolName || 'unknown_tool';
+        const signature = `${tool}:${serializeStepInput(data.arguments ?? null)}`;
+
+        if (signature === lastStepSignature) {
+          consecutiveStepCount += 1;
+        } else {
+          lastStepSignature = signature;
+          consecutiveStepCount = 1;
+        }
+
+        const seen = (stepExecutionCounts.get(signature) || 0) + 1;
+        stepExecutionCounts.set(signature, seen);
+
+        if (consecutiveStepCount >= MAX_CONSECUTIVE_IDENTICAL_STEPS) {
+          abortSessionRun(
+            `Possible recursive loop detected: repeated step "${tool}" ${consecutiveStepCount} times in a row.`,
+            { isLoop: true }
+          );
+          return;
+        }
+
+        if (seen >= MAX_TOOL_EXECUTIONS_PER_SIGNATURE) {
+          abortSessionRun(
+            `Possible recursive loop detected: step "${tool}" ran ${seen} times with near-identical input.`,
+            { isLoop: true }
+          );
+          return;
+        }
+
+        activeStep = {
+          tool,
+          signature,
+          startedAt: Date.now(),
+        };
+
         sendEvent({
           type: 'tool_call',
-          tool: data.toolName || 'unknown_tool',
+          tool,
           input: data.arguments ?? null,
         });
         return;
       }
 
       if (type === 'tool.execution_complete') {
+        activeStep = null;
         sendEvent({
           type: 'tool_result',
           tool: data.toolName || 'unknown_tool',
@@ -153,7 +231,20 @@ async function streamAgentReply(session, prompt, sendEvent) {
       }
     }));
 
-    const finalEvent = await session.sendAndWait({ prompt }, 120000);
+    let finalEvent;
+    try {
+      finalEvent = await session.sendAndWait({ prompt }, TWO_MINUTES_MS);
+    } catch (err) {
+      if (sessionError) throw sessionError;
+
+      const errMsg = err?.message || 'Unknown session error';
+      if (/session\.idle|timeout|timed.?out/i.test(errMsg)) {
+        const activeStepHint = activeStep ? ` Last active step: ${activeStep.tool}.` : '';
+        throw new Error(`Timeout after 2 minutes waiting for session.idle.${activeStepHint}`);
+      }
+      throw err;
+    }
+
     if (sessionError) throw sessionError;
     const finalContent = typeof finalEvent?.data?.content === 'string' ? finalEvent.data.content : '';
 
@@ -163,7 +254,99 @@ async function streamAgentReply(session, prompt, sendEvent) {
       sendEvent({ type: 'message', content: lastAssistantMessage });
     }
   } finally {
+    if (watchdogId) clearInterval(watchdogId);
     unsubs.forEach((u) => u());
+  }
+}
+
+function denyAllPermissions() {
+  return { kind: 'denied-by-rules' };
+}
+
+function buildPlanModePrompt(message) {
+  return [
+    'You are in PLAN mode.',
+    'Do not run tools.',
+    'Do not read or write files.',
+    'Do not execute commands.',
+    'Do not ask for permission or confirmation.',
+    'Return only final user-facing text.',
+    'Your response must contain these exact sections and nothing else:',
+    'Recommended Plan',
+    'Possible Next Steps',
+    'Under Recommended Plan, provide a concise ordered plan for how to approach the request.',
+    'Under Possible Next Steps, provide a short numbered list of options the user could choose from.',
+    'Do not include hidden reasoning, chain-of-thought, tool narration, or markdown code fences unless the user explicitly asked for code.',
+    '',
+    'User request:',
+    message,
+  ].join('\n');
+}
+
+function normalizePromptText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isPlanExecutionIntent(message) {
+  const normalized = normalizePromptText(message);
+  if (!normalized) return false;
+
+  const executionPatterns = [
+    /\bstart( implementing| implementation)?\b/,
+    /\bbegin( implementing| implementation)?\b/,
+    /\bgo ahead\b/,
+    /\bdo it\b/,
+    /\bimplement( it| this| that| the plan| these| those)?\b/,
+    /\bmake (the )?changes\b/,
+    /\bapply (the )?changes\b/,
+    /\bexecute( the plan| this| it| these steps| step \d+)?\b/,
+    /\bproceed\b/,
+    /\bcarry (it|this) out\b/,
+    /\bbuild it\b/,
+    /\bship it\b/,
+  ];
+
+  return executionPatterns.some((pattern) => pattern.test(normalized));
+}
+
+function buildPlanModeHandoffMessage() {
+  return [
+    'You are still in plan mode, so I will not start implementing from here.',
+    '',
+    'Choose how you want to continue:',
+    '1. Switch to agent mode to implement automatically.',
+    '2. Switch to ask mode to review and approve changes before they are made.',
+    '3. Stay in plan mode to refine or expand the plan only.',
+  ].join('\n');
+}
+
+async function streamPlanReply(prompt, sendEvent) {
+  if (!copilotClient) {
+    throw new Error('Copilot client not available.');
+  }
+
+  const planningSession = await copilotClient.createSession({
+    model: process.env.COPILOT_MODEL || 'gpt-5',
+    streaming: false,
+    onPermissionRequest: denyAllPermissions,
+    systemMessage: {
+      content: 'You are a planning assistant. Produce concise final answers only. Never use tools or make changes.',
+    },
+  });
+
+  try {
+    const result = await planningSession.sendAndWait({ prompt }, TWO_MINUTES_MS);
+    const content = typeof result?.data?.content === 'string' ? result.data.content.trim() : '';
+    if (!content) {
+      throw new Error('Plan mode returned an empty response.');
+    }
+    sendEvent({ type: 'message', content });
+  } finally {
+    try { await planningSession.disconnect(); } catch (_) {}
   }
 }
 
@@ -242,7 +425,7 @@ app.use(express.json());
 // =============================================================================
 
 app.post('/api/chat', async (req, res) => {
-  const { message } = req.body;
+  const { message, aiMode } = req.body;
 
   if (!message) {
     return res.status(400).json({ error: 'Message is required' });
@@ -254,6 +437,24 @@ app.post('/api/chat', async (req, res) => {
 
   if (agentBusy) {
     return res.status(429).json({ error: 'Agent is busy processing a previous request.' });
+  }
+
+  // --- Build mode-aware prompt ---
+  let enhancedPrompt = message;
+  const mode = String(aiMode || 'agent').toLowerCase().trim();
+  
+  switch (mode) {
+    case 'ask':
+      enhancedPrompt = `[MODE: ASK] Before making ANY file changes, you MUST ask the user for confirmation. Explain your plan and wait for approval. Only proceed if explicitly approved. Here is the request:\n\n${message}`;
+      break;
+    case 'plan':
+      enhancedPrompt = buildPlanModePrompt(message);
+      break;
+    case 'agent':
+    default:
+      // Agent mode: proceed autonomously (default behavior)
+      enhancedPrompt = `[MODE: AGENT] You are operating in autonomous agent mode. You have full permission to read/write files and execute commands. Proceed with the user's request:\n\n${message}`;
+      break;
   }
 
   // --- Set up SSE streaming response ---
@@ -271,15 +472,23 @@ app.post('/api/chat', async (req, res) => {
   agentBusy = true;
   try {
     try {
-      await streamAgentReply(agentSession, message, sendEvent);
+      if (mode === 'plan') {
+        if (isPlanExecutionIntent(message)) {
+          sendEvent({ type: 'message', content: buildPlanModeHandoffMessage() });
+        } else {
+          await streamPlanReply(enhancedPrompt, sendEvent);
+        }
+      } else {
+        await streamAgentReply(agentSession, enhancedPrompt, sendEvent, mode);
+      }
     } catch (err) {
-      if (!shouldRecreateAgentSession(err)) throw err;
+      if (mode === 'plan' || !shouldRecreateAgentSession(err)) throw err;
 
       console.warn('[copilot] session invalid, recreating and retrying once');
       sendEvent({ type: 'tool_call', tool: 'copilot.session.reset', input: null });
       await createAgentSession();
       sendEvent({ type: 'tool_result', tool: 'copilot.session.reset', output: { ok: true, sessionId: agentSession.sessionId } });
-      await streamAgentReply(agentSession, message, sendEvent);
+      await streamAgentReply(agentSession, enhancedPrompt, sendEvent, mode);
     }
 
     sendEvent({ type: 'done' });
@@ -292,7 +501,14 @@ app.post('/api/chat', async (req, res) => {
         message: 'Copilot auth is missing for the current mode. If using logged-in-user, sign in to Copilot on this machine. If using token mode, set GITHUB_TOKEN (or GH_TOKEN/COPILOT_GITHUB_TOKEN) and restart the server.',
       });
     } else {
-      sendEvent({ type: 'error', message });
+      const isTimeout = /timeout|timed.?out/i.test(message);
+      const metadata = err?.metadata || {};
+      sendEvent({
+        type: 'error',
+        message: isTimeout ? 'Request timed out after 2 minutes.' : message,
+        isTimeout,
+        isLoop: Boolean(metadata.isLoop),
+      });
     }
   } finally {
     agentBusy = false;
@@ -521,6 +737,21 @@ function runGit(args, cwd) {
   });
 }
 
+function runGitWithAllowedCodes(args, cwd, allowedExitCodes = [0]) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('git', args, { cwd, env: process.env });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('close', (code) => {
+      if (!allowedExitCodes.includes(code)) reject(new Error(stderr.trim() || `git exited ${code}`));
+      else resolve(stdout);
+    });
+    proc.on('error', reject);
+  });
+}
+
 function isGitRepo(dirPath) {
   return fs.existsSync(path.join(dirPath, '.git'));
 }
@@ -638,6 +869,16 @@ function parseNumstat(raw) {
   return map;
 }
 
+function getFileMtimeMs(repoCwd, repoRelativePath) {
+  try {
+    const absPath = path.resolve(repoCwd, repoRelativePath);
+    const stat = fs.statSync(absPath);
+    return Number.isFinite(stat.mtimeMs) ? Math.round(stat.mtimeMs) : 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
 async function getGitChangeSummary(repoCwd = WORKSPACE) {
   const statusRaw = await runGit(['status', '--porcelain=v1', '-b', '--untracked-files=all'], repoCwd);
   const files = parsePorcelain(statusRaw);
@@ -652,6 +893,7 @@ async function getGitChangeSummary(repoCwd = WORKSPACE) {
       status: file.status,
       added: stat.added,
       removed: stat.removed,
+      mtimeMs: getFileMtimeMs(repoCwd, file.path),
       staged: file.staged,
       unstaged: file.unstaged,
       untracked: file.untracked,
@@ -699,6 +941,77 @@ async function getWorkspaceGitChangeSummary() {
   );
 
   return { totals, files: allFiles };
+}
+
+// Returns the unified diff patch for a single file.
+// If a snapshot was captured at the last Keep, diffs against that snapshot so
+// only changes SINCE the last keep are shown.  Falls back to HEAD otherwise.
+async function getPatchForFile(file, repoCwd) {
+  const absPath = path.resolve(repoCwd, file.path);
+  const wsKey = path.relative(WORKSPACE, absPath).replace(/\\/g, '/');
+  const snapshotContent = keepSnapshots.get(wsKey);
+
+  if (snapshotContent !== undefined) {
+    const tmpFile = path.join(os.tmpdir(), `pocketide-snap-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    try {
+      fs.writeFileSync(tmpFile, snapshotContent, 'utf8');
+      return await runGitWithAllowedCodes(
+        ['diff', '--no-index', '--no-color', '--unified=3', '--', tmpFile, absPath],
+        repoCwd,
+        [0, 1]
+      );
+    } finally {
+      try { fs.unlinkSync(tmpFile); } catch (_) {}
+    }
+  }
+
+  if (file.untracked) {
+    return await runGitWithAllowedCodes(
+      ['diff', '--no-index', '--no-color', '--unified=3', '--', '/dev/null', file.path],
+      repoCwd,
+      [0, 1]
+    );
+  }
+  return await runGit(['diff', '--no-color', '--unified=3', 'HEAD', '--', file.path], repoCwd);
+}
+
+async function getWorkspaceGitDiffDetails() {
+  const repoPaths = listWorkspaceRepos(WORKSPACE);
+  const files = [];
+
+  for (const repoCwd of repoPaths) {
+    const repoId = normalizeRepoId(repoCwd);
+    const repoName = path.basename(repoCwd);
+    const summary = await getGitChangeSummary(repoCwd);
+
+    for (const file of summary.files) {
+      const patch = await getPatchForFile(file, repoCwd);
+
+      if (!patch.trim()) continue;
+
+      files.push({
+        path: toWorkspaceRelativePath(repoCwd, file.path),
+        repo: repoId,
+        repoName,
+        status: file.status,
+        added: file.added || 0,
+        removed: file.removed || 0,
+        patch,
+      });
+    }
+  }
+
+  files.sort((a, b) => a.path.localeCompare(b.path));
+  const totals = files.reduce(
+    (acc, file) => ({
+      files: acc.files + 1,
+      added: acc.added + (file.added || 0),
+      removed: acc.removed + (file.removed || 0),
+    }),
+    { files: 0, added: 0, removed: 0 }
+  );
+
+  return { totals, files };
 }
 
 function buildHeuristicCommitMessage(stagedFiles) {
@@ -762,7 +1075,7 @@ async function generateAiCommitMessage(stagedFiles) {
   try {
     const result = await oneShotSession.sendAndWait({
       prompt: buildCommitMessagePrompt(stagedFiles),
-    }, 120000);
+    }, TWO_MINUTES_MS);
 
     const message = extractSingleLineMessage(result?.data?.content || '');
     if (!message) {
@@ -916,6 +1229,66 @@ app.get('/api/git/changes-summary', async (req, res) => {
     }
     res.status(500).json({ error: err.message });
   }
+});
+
+// GET /api/git/changes-diff → { totals: { files, added, removed }, files: [{ path, patch, ... }] }
+app.get('/api/git/changes-diff', async (req, res) => {
+  try {
+    const summary = hasExplicitRepoInRequest(req)
+      ? await (async () => {
+        const repoCwd = getRepoCwdFromRequest(req);
+        const repoId = normalizeRepoId(repoCwd);
+        const repoName = path.basename(repoCwd);
+        const base = await getGitChangeSummary(repoCwd);
+        const files = [];
+
+        for (const file of base.files) {
+          const patch = await getPatchForFile(file, repoCwd);
+
+          if (!patch.trim()) continue;
+          files.push({
+            ...file,
+            path: file.path,
+            repo: repoId,
+            repoName,
+            patch,
+          });
+        }
+
+        const totals = files.reduce(
+          (acc, file) => ({ files: acc.files + 1, added: acc.added + (file.added || 0), removed: acc.removed + (file.removed || 0) }),
+          { files: 0, added: 0, removed: 0 }
+        );
+
+        return { totals, files };
+      })()
+      : await getWorkspaceGitDiffDetails();
+    res.json(summary);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/git/keep-snapshot  body: { paths: string[], repo?: string }
+// Captures the current content of each path so that subsequent /api/git/changes-diff
+// calls show only what changed SINCE this snapshot rather than since HEAD.
+app.post('/api/git/keep-snapshot', (req, res) => {
+  const { paths } = req.body || {};
+  if (!Array.isArray(paths) || !paths.length) return res.status(400).json({ error: 'paths required' });
+
+  const repoCwd = hasExplicitRepoInRequest(req) ? getRepoCwdFromRequest(req) : WORKSPACE;
+
+  for (const filePath of paths) {
+    try {
+      const absPath = path.resolve(repoCwd, filePath);
+      const wsKey = path.relative(WORKSPACE, absPath).replace(/\\/g, '/');
+      if (wsKey.startsWith('..')) continue;
+      if (!fs.existsSync(absPath)) continue;
+      keepSnapshots.set(wsKey, fs.readFileSync(absPath, 'utf8'));
+    } catch (_) {}
+  }
+
+  res.json({ ok: true });
 });
 
 // GET /api/git/branches → { branches: [{ name, fullName, current, upstream, remote }] }
@@ -1240,15 +1613,27 @@ function resolveShellPath() {
   return '/bin/sh';
 }
 
+function resolveShellArgs(shellPath) {
+  const base = path.basename(shellPath || '').toLowerCase();
+
+  // Use interactive mode so arrow-key history works when possible.
+  if (base === 'zsh' || base === 'bash' || base === 'sh') {
+    return ['-i'];
+  }
+
+  return [];
+}
+
 io.on('connection', (socket) => {
   console.log(`[terminal] client connected: ${socket.id}`);
 
   const shellPath = resolveShellPath();
+  const shellArgs = resolveShellArgs(shellPath);
   let shell;
   let isPty = false;
 
   try {
-    shell = pty.spawn(shellPath, [], {
+    shell = pty.spawn(shellPath, shellArgs, {
       name: 'xterm-color',
       cwd: WORKSPACE,
       env: { ...process.env, TERM: 'xterm-color' },
@@ -1258,7 +1643,7 @@ io.on('connection', (socket) => {
     console.error(`[terminal] failed to spawn shell for ${socket.id}:`, err.message);
 
     // Fallback for environments where node-pty cannot spawn (e.g. ABI/runtime issues).
-    shell = spawn('/bin/sh', [], {
+    shell = spawn(shellPath, shellArgs, {
       cwd: WORKSPACE,
       env: { ...process.env, TERM: 'xterm-color' },
       stdio: ['pipe', 'pipe', 'pipe'],
