@@ -7,6 +7,7 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 
 function resolveWorkspacePath() {
   if (process.env.WORKSPACE && fs.existsSync(process.env.WORKSPACE)) {
@@ -37,6 +38,8 @@ const TWO_MINUTES_MS = 2 * 60 * 1000;
 const TOOL_STEP_TIMEOUT_MS = 45 * 1000;
 const MAX_CONSECUTIVE_IDENTICAL_STEPS = 8;
 const MAX_TOOL_EXECUTIONS_PER_SIGNATURE = 14;
+const CLOUD_JOB_RETENTION_MS = 24 * 60 * 60 * 1000;
+const MAX_CLOUD_JOB_EVENTS = 400;
 
 // Change server CWD to workspace so the Copilot CLI subprocess inherits it,
 // matching the same working environment as the node-pty bash shells.
@@ -50,13 +53,319 @@ let copilotClient = null;
 let agentSession = null;
 let agentBusy = false; // guard against concurrent sends on the same session
 let activeCopilotAuthMode = 'unknown';
+const providerSecretKey = crypto
+  .createHash('sha256')
+  .update(String(process.env.PROVIDER_SECRET_KEY || process.env.POCKETIDE_PROVIDER_SECRET_KEY || `${os.hostname()}:${process.pid}`))
+  .digest();
+
+function sealSecret(value) {
+  const plain = String(value || '').trim();
+  if (!plain) return '';
+
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', providerSecretKey, iv);
+  const encrypted = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `enc:${iv.toString('base64')}:${tag.toString('base64')}:${encrypted.toString('base64')}`;
+}
+
+function unsealSecret(value) {
+  const raw = String(value || '');
+  if (!raw) return '';
+  if (!raw.startsWith('enc:')) return raw;
+
+  const parts = raw.split(':');
+  if (parts.length !== 4) return '';
+
+  try {
+    const [, ivB64, tagB64, dataB64] = parts;
+    const iv = Buffer.from(ivB64, 'base64');
+    const tag = Buffer.from(tagB64, 'base64');
+    const encrypted = Buffer.from(dataB64, 'base64');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', providerSecretKey, iv);
+    decipher.setAuthTag(tag);
+    const plain = Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
+    return plain.trim();
+  } catch (_) {
+    return '';
+  }
+}
+
+const runtimeProviderConfig = {
+  copilot: {
+    authType: String(process.env.COPILOT_AUTH_MODE || 'logged-in-user').trim().toLowerCase() === 'token' ? 'token' : 'logged-in-user',
+    token: sealSecret(process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.COPILOT_GITHUB_TOKEN || ''),
+  },
+  codex: {
+    apiKey: sealSecret(process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY || ''),
+    baseUrl: process.env.CODEX_BASE_URL || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
+    model: process.env.CODEX_MODEL || 'gpt-5-codex',
+  },
+  local: {
+    apiKey: sealSecret(process.env.LOCAL_AGENT_API_KEY || ''),
+    baseUrl: process.env.LOCAL_AGENT_BASE_URL || 'http://127.0.0.1:11434/v1',
+    model: process.env.LOCAL_AGENT_MODEL || 'qwen2.5-coder:latest',
+  },
+};
+let copilotInitError = null;
+const cloudJobs = new Map();
+const cloudJobQueue = [];
+let cloudJobWorkerActive = false;
+
+function normalizeProvider(value) {
+  const provider = String(value || 'copilot').toLowerCase().trim();
+  if (provider === 'codex' || provider === 'local') return provider;
+  return 'copilot';
+}
+
+function resolveCodexApiKey() {
+  return unsealSecret(runtimeProviderConfig.codex.apiKey) || '';
+}
+
+function resolveLocalApiKey() {
+  return unsealSecret(runtimeProviderConfig.local.apiKey) || '';
+}
+
+function redactSecret(secret) {
+  if (!secret) return '';
+  const value = String(secret);
+  if (value.length <= 6) return '*'.repeat(value.length);
+  return `${value.slice(0, 3)}***${value.slice(-3)}`;
+}
+
+function createCloudJobId() {
+  return `job_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function pushCloudJobEvent(job, type, data = {}) {
+  job.nextEventId += 1;
+  const evt = {
+    id: job.nextEventId,
+    jobId: job.id,
+    ts: nowIso(),
+    type,
+    data,
+  };
+  job.events.push(evt);
+  if (job.events.length > MAX_CLOUD_JOB_EVENTS) {
+    job.events.splice(0, job.events.length - MAX_CLOUD_JOB_EVENTS);
+  }
+  job.updatedAt = evt.ts;
+}
+
+function setCloudJobStatus(job, status, extras = {}) {
+  job.status = status;
+  Object.assign(job, extras);
+  job.updatedAt = nowIso();
+  pushCloudJobEvent(job, 'job.status', { status });
+}
+
+function serializeCloudJob(job, includeEvents = false) {
+  const payload = {
+    jobId: job.id,
+    provider: normalizeProvider(job.provider || 'copilot'),
+    status: job.status,
+    aiMode: job.aiMode,
+    message: job.message,
+    turnId: job.turnId,
+    resultText: job.resultText || null,
+    error: job.error || null,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    cancelRequested: Boolean(job.cancelRequested),
+  };
+  if (includeEvents) payload.events = job.events;
+  return payload;
+}
+
+function cleanupCloudJobs() {
+  const cutoff = Date.now() - CLOUD_JOB_RETENTION_MS;
+  for (const [id, job] of cloudJobs.entries()) {
+    if (!job.finishedAt) continue;
+    const finished = Date.parse(job.finishedAt);
+    if (!Number.isFinite(finished)) continue;
+    if (finished < cutoff) {
+      cloudJobs.delete(id);
+    }
+  }
+}
+
+function enqueueCloudJob(jobId) {
+  cloudJobQueue.push(jobId);
+  processCloudJobQueue().catch((err) => {
+    console.error('[cloud-jobs] queue processor error:', err);
+  });
+}
+
+function buildEnhancedPromptForMode(message, aiMode) {
+  const mode = String(aiMode || 'agent').toLowerCase().trim();
+
+  switch (mode) {
+    case 'ask':
+      return `[MODE: ASK] Before making ANY file changes, you MUST ask the user for confirmation. Explain your plan and wait for approval. Only proceed if explicitly approved. Here is the request:\n\n${message}`;
+    case 'plan':
+      return buildPlanModePrompt(message);
+    case 'cloud':
+    case 'agent':
+    default:
+      return `[MODE: AGENT] You are operating in autonomous agent mode. You have full permission to read/write files and execute commands. Proceed with the user's request:\n\n${message}`;
+  }
+}
+
+async function runSingleCloudJob(job) {
+  const provider = normalizeProvider(job.provider || 'copilot');
+  if (provider === 'copilot' && !copilotClient) {
+    throw new Error('Copilot agent not initialised. Check Copilot auth/login for the selected auth mode.');
+  }
+
+  let cloudSession = null;
+  const effectiveMode = job.aiMode === 'cloud' ? 'agent' : job.aiMode;
+  const enhancedPrompt = buildEnhancedPromptForMode(job.message, effectiveMode);
+  const eventAccumulator = {
+    finalMessage: '',
+    sawMessage: false,
+    sawError: false,
+  };
+
+  const sendEvent = (event) => {
+    if (job.cancelRequested && job.status !== 'cancelled') {
+      setCloudJobStatus(job, 'cancelled', { finishedAt: nowIso() });
+      pushCloudJobEvent(job, 'job.cancelled', { reason: 'Cancelled by user before completion.' });
+      throw new Error('Job cancelled by user');
+    }
+
+    if (event.type === 'message' && typeof event.content === 'string') {
+      eventAccumulator.sawMessage = true;
+      eventAccumulator.finalMessage = event.content;
+    }
+
+    if (event.type === 'error') {
+      eventAccumulator.sawError = true;
+    }
+
+    pushCloudJobEvent(job, event.type, event);
+  };
+
+  if (effectiveMode === 'plan' && isPlanExecutionIntent(job.message)) {
+    sendEvent({ type: 'message', content: buildPlanModeHandoffMessage() });
+    return eventAccumulator.finalMessage;
+  }
+
+  if (provider === 'codex') {
+    const finalMessage = await streamCodexReply(enhancedPrompt, sendEvent, effectiveMode);
+    return finalMessage;
+  }
+
+  if (provider === 'local') {
+    const finalMessage = await streamLocalReply(enhancedPrompt, sendEvent, effectiveMode);
+    return finalMessage;
+  }
+
+  try {
+    if (effectiveMode !== 'plan') {
+      cloudSession = await copilotClient.createSession(buildAgentSessionOptions());
+      pushCloudJobEvent(job, 'session.started', { sessionId: cloudSession.sessionId });
+    }
+
+    if (effectiveMode === 'plan') {
+      await streamPlanReply(enhancedPrompt, sendEvent);
+    } else {
+      await streamAgentReply(cloudSession, enhancedPrompt, sendEvent, effectiveMode);
+    }
+  } catch (err) {
+    if (effectiveMode !== 'plan' && shouldRecreateAgentSession(err)) {
+      pushCloudJobEvent(job, 'tool_call', { type: 'tool_call', tool: 'copilot.session.reset', input: null });
+
+      try { await cloudSession?.disconnect(); } catch (_) {}
+      cloudSession = await copilotClient.createSession(buildAgentSessionOptions());
+
+      pushCloudJobEvent(job, 'tool_result', {
+        type: 'tool_result',
+        tool: 'copilot.session.reset',
+        output: { ok: true, sessionId: cloudSession.sessionId },
+      });
+      await streamAgentReply(cloudSession, enhancedPrompt, sendEvent, effectiveMode);
+    } else {
+      throw err;
+    }
+  } finally {
+    if (cloudSession) {
+      try { await cloudSession.disconnect(); } catch (_) {}
+      pushCloudJobEvent(job, 'session.ended', {});
+    }
+  }
+
+  if (!eventAccumulator.sawMessage) {
+    return '';
+  }
+  return eventAccumulator.finalMessage;
+}
+
+async function processCloudJobQueue() {
+  if (cloudJobWorkerActive) return;
+  cloudJobWorkerActive = true;
+
+  try {
+    while (cloudJobQueue.length > 0) {
+      const jobId = cloudJobQueue.shift();
+      const job = cloudJobs.get(jobId);
+      if (!job) continue;
+      if (job.status !== 'queued') continue;
+
+      if (job.cancelRequested) {
+        setCloudJobStatus(job, 'cancelled', { finishedAt: nowIso() });
+        pushCloudJobEvent(job, 'job.cancelled', { reason: 'Cancelled before execution.' });
+        continue;
+      }
+
+      setCloudJobStatus(job, 'running', { startedAt: nowIso() });
+
+      try {
+        const finalMessage = await runSingleCloudJob(job);
+        if (job.status !== 'cancelled') {
+          setCloudJobStatus(job, 'succeeded', {
+            finishedAt: nowIso(),
+            resultText: finalMessage || '',
+          });
+          pushCloudJobEvent(job, 'job.completed', {
+            status: 'succeeded',
+            finalMessage: finalMessage || '',
+          });
+        }
+      } catch (err) {
+        if (job.status === 'cancelled') continue;
+
+        const message = err?.message || 'Unknown cloud job error';
+        const isTimeout = /timeout|timed.?out/i.test(message);
+        const metadata = err?.metadata || {};
+
+        job.error = {
+          message: isTimeout ? 'Request timed out after 2 minutes.' : message,
+          isTimeout,
+          isLoop: Boolean(metadata.isLoop),
+        };
+
+        setCloudJobStatus(job, 'failed', { finishedAt: nowIso() });
+        pushCloudJobEvent(job, 'job.failed', job.error);
+      }
+    }
+  } finally {
+    cloudJobWorkerActive = false;
+  }
+}
 
 function resolveGithubToken() {
-  return process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.COPILOT_GITHUB_TOKEN || null;
+  return unsealSecret(runtimeProviderConfig.copilot.token) || process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.COPILOT_GITHUB_TOKEN || null;
 }
 
 function resolveCopilotAuthConfig() {
-  const mode = String(process.env.COPILOT_AUTH_MODE || 'logged-in-user').trim().toLowerCase();
+  const mode = String(runtimeProviderConfig.copilot.authType || 'logged-in-user').trim().toLowerCase();
   const token = resolveGithubToken();
 
   if (mode === 'token') {
@@ -77,18 +386,94 @@ function resolveCopilotAuthConfig() {
   return { mode: 'logged-in-user', config: { useLoggedInUser: true } };
 }
 
-async function createAgentSession() {
-  if (!copilotClient) {
-    throw new Error('Copilot client not initialised');
+async function streamCodexReply(prompt, sendEvent, mode = 'agent') {
+  const apiKey = resolveCodexApiKey();
+  if (!apiKey) {
+    throw new Error('Codex is not configured. Add an API key in Settings > Agent Controls > Provider Sign-in.');
   }
 
+  const OpenAI = require('openai');
+  const client = new OpenAI({
+    apiKey,
+    baseURL: String(runtimeProviderConfig.codex.baseUrl || 'https://api.openai.com/v1').trim(),
+  });
+
+  const effectiveMode = String(mode || 'agent').toLowerCase().trim();
+  const systemByMode = effectiveMode === 'plan'
+    ? 'You are in PLAN mode. Do not run tools. Return only concise final user-facing text.'
+    : effectiveMode === 'ask'
+      ? 'You are in ASK mode. Explain intent before any potentially destructive suggestion and ask for explicit user confirmation.'
+      : 'You are in AGENT mode. Provide direct, actionable coding help.';
+
+  const result = await client.chat.completions.create({
+    model: String(runtimeProviderConfig.codex.model || 'gpt-5-codex').trim(),
+    temperature: 0.2,
+    messages: [
+      { role: 'system', content: systemByMode },
+      { role: 'user', content: prompt },
+    ],
+  });
+
+  const content = result?.choices?.[0]?.message?.content;
+  const text = Array.isArray(content)
+    ? content.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('').trim()
+    : String(content || '').trim();
+
+  if (!text) {
+    throw new Error('Codex returned an empty response.');
+  }
+
+  sendEvent({ type: 'message', content: text });
+  return text;
+}
+
+async function streamLocalReply(prompt, sendEvent, mode = 'agent') {
+  const baseUrl = String(runtimeProviderConfig.local.baseUrl || '').trim();
+  const model = String(runtimeProviderConfig.local.model || '').trim();
+  const apiKey = resolveLocalApiKey();
+
+  if (!baseUrl || !model) {
+    throw new Error('Local provider is not configured. Set Local base URL and model in Settings > Provider Sign-in.');
+  }
+
+  const OpenAI = require('openai');
+  const client = new OpenAI({
+    apiKey: apiKey || 'local-agent-no-auth',
+    baseURL: baseUrl,
+  });
+
+  const effectiveMode = String(mode || 'agent').toLowerCase().trim();
+  const systemByMode = effectiveMode === 'plan'
+    ? 'You are in PLAN mode. Do not run tools. Return only concise final user-facing text.'
+    : effectiveMode === 'ask'
+      ? 'You are in ASK mode. Explain intent before any potentially destructive suggestion and ask for explicit user confirmation.'
+      : 'You are in AGENT mode. Provide direct, actionable coding help.';
+
+  const result = await client.chat.completions.create({
+    model,
+    temperature: 0.2,
+    messages: [
+      { role: 'system', content: systemByMode },
+      { role: 'user', content: prompt },
+    ],
+  });
+
+  const content = result?.choices?.[0]?.message?.content;
+  const text = Array.isArray(content)
+    ? content.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('').trim()
+    : String(content || '').trim();
+
+  if (!text) {
+    throw new Error('Local provider returned an empty response.');
+  }
+
+  sendEvent({ type: 'message', content: text });
+  return text;
+}
+
+function buildAgentSessionOptions() {
   const { approveAll } = require('@github/copilot-sdk');
-
-  if (agentSession) {
-    try { await agentSession.disconnect(); } catch (_) {}
-  }
-
-  agentSession = await copilotClient.createSession({
+  return {
     model: process.env.COPILOT_MODEL || 'gpt-5',
     streaming: true,
     onPermissionRequest: approveAll,
@@ -96,7 +481,19 @@ async function createAgentSession() {
       content:
         'You are an autonomous coding agent. You have permission to read/write files in /workspace and execute terminal commands to manage the repository.',
     },
-  });
+  };
+}
+
+async function createAgentSession() {
+  if (!copilotClient) {
+    throw new Error('Copilot client not initialised');
+  }
+
+  if (agentSession) {
+    try { await agentSession.disconnect(); } catch (_) {}
+  }
+
+  agentSession = await copilotClient.createSession(buildAgentSessionOptions());
 
   console.log(`[copilot] agent session ready — ${agentSession.sessionId}`);
   return agentSession;
@@ -355,6 +752,16 @@ async function initCopilotAgent() {
     const { CopilotClient } = require('@github/copilot-sdk');
     const auth = resolveCopilotAuthConfig();
     activeCopilotAuthMode = auth.mode;
+    copilotInitError = null;
+
+    if (agentSession) {
+      try { await agentSession.disconnect(); } catch (_) {}
+      agentSession = null;
+    }
+    if (copilotClient) {
+      try { await copilotClient.stop(); } catch (_) {}
+      copilotClient = null;
+    }
 
     copilotClient = new CopilotClient(auth.config);
 
@@ -367,6 +774,7 @@ async function initCopilotAgent() {
     copilotClient = null;
     agentSession = null;
     activeCopilotAuthMode = 'unavailable';
+    copilotInitError = err?.message || 'Copilot initialisation failed.';
   }
 }
 
@@ -408,6 +816,8 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(express.json());
 
+setInterval(cleanupCloudJobs, 10 * 60 * 1000);
+
 // =============================================================================
 // POST /api/chat — Agent Mode with SSE streaming
 //
@@ -426,36 +836,23 @@ app.use(express.json());
 
 app.post('/api/chat', async (req, res) => {
   const { message, aiMode } = req.body;
+  const provider = normalizeProvider(req.body?.provider || 'copilot');
 
   if (!message) {
     return res.status(400).json({ error: 'Message is required' });
   }
 
-  if (!agentSession) {
+  if (provider === 'copilot' && !agentSession) {
     return res.status(503).json({ error: 'Copilot agent not initialised. Check Copilot auth/login for the selected auth mode.' });
   }
 
-  if (agentBusy) {
+  if (provider === 'copilot' && agentBusy) {
     return res.status(429).json({ error: 'Agent is busy processing a previous request.' });
   }
 
   // --- Build mode-aware prompt ---
-  let enhancedPrompt = message;
   const mode = String(aiMode || 'agent').toLowerCase().trim();
-  
-  switch (mode) {
-    case 'ask':
-      enhancedPrompt = `[MODE: ASK] Before making ANY file changes, you MUST ask the user for confirmation. Explain your plan and wait for approval. Only proceed if explicitly approved. Here is the request:\n\n${message}`;
-      break;
-    case 'plan':
-      enhancedPrompt = buildPlanModePrompt(message);
-      break;
-    case 'agent':
-    default:
-      // Agent mode: proceed autonomously (default behavior)
-      enhancedPrompt = `[MODE: AGENT] You are operating in autonomous agent mode. You have full permission to read/write files and execute commands. Proceed with the user's request:\n\n${message}`;
-      break;
-  }
+  const enhancedPrompt = buildEnhancedPromptForMode(message, mode);
 
   // --- Set up SSE streaming response ---
   res.setHeader('Content-Type', 'text/event-stream');
@@ -469,10 +866,14 @@ app.post('/api/chat', async (req, res) => {
     }
   };
 
-  agentBusy = true;
+  if (provider === 'copilot') agentBusy = true;
   try {
     try {
-      if (mode === 'plan') {
+      if (provider === 'codex') {
+        await streamCodexReply(enhancedPrompt, sendEvent, mode);
+      } else if (provider === 'local') {
+        await streamLocalReply(enhancedPrompt, sendEvent, mode);
+      } else if (mode === 'plan') {
         if (isPlanExecutionIntent(message)) {
           sendEvent({ type: 'message', content: buildPlanModeHandoffMessage() });
         } else {
@@ -482,7 +883,7 @@ app.post('/api/chat', async (req, res) => {
         await streamAgentReply(agentSession, enhancedPrompt, sendEvent, mode);
       }
     } catch (err) {
-      if (mode === 'plan' || !shouldRecreateAgentSession(err)) throw err;
+      if (provider !== 'copilot' || mode === 'plan' || !shouldRecreateAgentSession(err)) throw err;
 
       console.warn('[copilot] session invalid, recreating and retrying once');
       sendEvent({ type: 'tool_call', tool: 'copilot.session.reset', input: null });
@@ -495,10 +896,14 @@ app.post('/api/chat', async (req, res) => {
   } catch (err) {
     console.error('[copilot] chat error:', err);
     const message = err?.message || 'Unknown chat error';
-    if (/authentication info|custom provider/i.test(message)) {
+    if (/authentication info|custom provider|401|unauthorized|api key/i.test(message)) {
       sendEvent({
         type: 'error',
-        message: 'Copilot auth is missing for the current mode. If using logged-in-user, sign in to Copilot on this machine. If using token mode, set GITHUB_TOKEN (or GH_TOKEN/COPILOT_GITHUB_TOKEN) and restart the server.',
+        message: provider === 'copilot'
+          ? 'Copilot auth is missing for the current mode. Use Provider Sign-in in Settings (logged-in user or token).'
+          : provider === 'local'
+            ? 'Local provider rejected auth. Verify Local base URL/API key in Settings > Provider Sign-in.'
+            : 'Codex auth is missing or invalid. Add a Codex API key in Settings > Provider Sign-in.',
       });
     } else {
       const isTimeout = /timeout|timed.?out/i.test(message);
@@ -511,9 +916,115 @@ app.post('/api/chat', async (req, res) => {
       });
     }
   } finally {
-    agentBusy = false;
+    if (provider === 'copilot') agentBusy = false;
     res.end();
   }
+});
+
+// -----------------------------------------------------------------------------
+// Cloud jobs API (background execution queue)
+// -----------------------------------------------------------------------------
+
+app.post('/api/jobs', (req, res) => {
+  const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+  if (!message) {
+    return res.status(400).json({ error: 'message is required' });
+  }
+
+  const rawMode = String(req.body?.aiMode || 'cloud').toLowerCase().trim();
+  const aiMode = ['agent', 'ask', 'plan', 'cloud'].includes(rawMode) ? rawMode : 'cloud';
+  const provider = normalizeProvider(req.body?.provider || 'copilot');
+  const turnId = typeof req.body?.turnId === 'string' && req.body.turnId.trim() ? req.body.turnId.trim() : null;
+
+  const job = {
+    id: createCloudJobId(),
+    status: 'queued',
+    provider,
+    aiMode,
+    message,
+    turnId,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    startedAt: null,
+    finishedAt: null,
+    resultText: '',
+    error: null,
+    cancelRequested: false,
+    nextEventId: 0,
+    events: [],
+  };
+
+  cloudJobs.set(job.id, job);
+  pushCloudJobEvent(job, 'job.created', {
+    status: job.status,
+    aiMode: job.aiMode,
+    turnId: job.turnId,
+  });
+  enqueueCloudJob(job.id);
+
+  res.status(202).json({
+    jobId: job.id,
+    provider: job.provider,
+    status: job.status,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+  });
+});
+
+app.get('/api/jobs', (req, res) => {
+  const limitRaw = Number.parseInt(String(req.query?.limit || '30'), 10);
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 30;
+
+  const jobs = [...cloudJobs.values()]
+    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+    .slice(0, limit)
+    .map((job) => serializeCloudJob(job, false));
+
+  res.json({ jobs });
+});
+
+app.get('/api/jobs/:jobId', (req, res) => {
+  const job = cloudJobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+
+  res.json({ job: serializeCloudJob(job, true) });
+});
+
+app.get('/api/jobs/:jobId/events', (req, res) => {
+  const job = cloudJobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+
+  const sinceRaw = Number.parseInt(String(req.query?.since || '0'), 10);
+  const since = Number.isFinite(sinceRaw) ? sinceRaw : 0;
+  const events = job.events.filter((evt) => evt.id > since);
+  const nextCursor = events.length ? events[events.length - 1].id : since;
+
+  res.json({ events, nextCursor });
+});
+
+app.post('/api/jobs/:jobId/cancel', (req, res) => {
+  const job = cloudJobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+
+  if (['succeeded', 'failed', 'cancelled'].includes(job.status)) {
+    return res.json({ ok: true, job: serializeCloudJob(job, false) });
+  }
+
+  job.cancelRequested = true;
+  pushCloudJobEvent(job, 'job.cancel_requested', { status: job.status });
+
+  if (job.status === 'queued') {
+    setCloudJobStatus(job, 'cancelled', { finishedAt: nowIso() });
+    pushCloudJobEvent(job, 'job.cancelled', { reason: 'Cancelled before execution.' });
+  }
+
+  res.json({ ok: true, job: serializeCloudJob(job, false) });
 });
 
 // Reset the persistent agent session (new blank conversation)
@@ -536,11 +1047,178 @@ app.post('/api/chat/reset', async (req, res) => {  if (!copilotClient) {
 // Runtime info for UI/debugging of chat provider/auth mode
 app.get('/api/chat/runtime', (req, res) => {
   res.json({
-    provider: 'github-copilot-sdk',
-    authMode: activeCopilotAuthMode,
-    model: process.env.COPILOT_MODEL || 'gpt-5',
-    ready: Boolean(agentSession),
+    defaultProvider: 'copilot',
+    providers: {
+      copilot: {
+        ready: Boolean(agentSession),
+        authMode: activeCopilotAuthMode,
+        model: process.env.COPILOT_MODEL || 'gpt-5',
+      },
+      codex: {
+        ready: Boolean(resolveCodexApiKey()),
+        model: String(runtimeProviderConfig.codex.model || 'gpt-5-codex').trim(),
+        baseUrl: String(runtimeProviderConfig.codex.baseUrl || '').trim(),
+      },
+      local: {
+        ready: Boolean(String(runtimeProviderConfig.local.baseUrl || '').trim() && String(runtimeProviderConfig.local.model || '').trim()),
+        model: String(runtimeProviderConfig.local.model || '').trim(),
+        baseUrl: String(runtimeProviderConfig.local.baseUrl || '').trim(),
+      },
+    },
   });
+});
+
+function providerStatusPayload() {
+  const copilotToken = resolveGithubToken();
+  const codexKey = resolveCodexApiKey();
+  const localKey = resolveLocalApiKey();
+  const localBaseUrl = String(runtimeProviderConfig.local.baseUrl || '').trim();
+  const localModel = String(runtimeProviderConfig.local.model || '').trim();
+  return {
+    copilot: {
+      authType: runtimeProviderConfig.copilot.authType,
+      ready: Boolean(agentSession),
+      authMode: activeCopilotAuthMode,
+      tokenConfigured: Boolean(copilotToken),
+      tokenPreview: redactSecret(copilotToken),
+      error: copilotInitError,
+    },
+    codex: {
+      ready: Boolean(codexKey),
+      apiKeyConfigured: Boolean(codexKey),
+      apiKeyPreview: redactSecret(codexKey),
+      baseUrl: String(runtimeProviderConfig.codex.baseUrl || '').trim(),
+      model: String(runtimeProviderConfig.codex.model || 'gpt-5-codex').trim(),
+    },
+    local: {
+      ready: Boolean(localBaseUrl && localModel),
+      apiKeyConfigured: Boolean(localKey),
+      apiKeyPreview: redactSecret(localKey),
+      baseUrl: localBaseUrl,
+      model: localModel,
+      message: localBaseUrl && localModel
+        ? 'Local provider is configured. Ensure your Local-Agent exposes an OpenAI-compatible /chat/completions endpoint.'
+        : 'Configure Local base URL and model to enable Local provider.',
+    },
+  };
+}
+
+app.get('/api/providers/status', (req, res) => {
+  res.json({ providers: providerStatusPayload() });
+});
+
+app.post('/api/providers/local/health', async (req, res) => {
+  const baseUrl = String(req.body?.baseUrl || runtimeProviderConfig.local.baseUrl || '').trim();
+  const model = String(req.body?.model || runtimeProviderConfig.local.model || '').trim();
+  const apiKey = typeof req.body?.apiKey === 'string' ? req.body.apiKey.trim() : resolveLocalApiKey();
+
+  if (!baseUrl || !model) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Local base URL and model are required.',
+    });
+  }
+
+  try {
+    const OpenAI = require('openai');
+    const client = new OpenAI({
+      apiKey: apiKey || 'local-agent-no-auth',
+      baseURL: baseUrl,
+    });
+
+    const timeoutMs = 12_000;
+    const requestPromise = client.chat.completions.create({
+      model,
+      temperature: 0,
+      messages: [{ role: 'user', content: 'Reply with exactly: pong' }],
+      max_tokens: 12,
+    });
+
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Local provider test timed out.')), timeoutMs);
+    });
+
+    const result = await Promise.race([requestPromise, timeoutPromise]);
+    const content = result?.choices?.[0]?.message?.content;
+    const text = Array.isArray(content)
+      ? content.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('').trim()
+      : String(content || '').trim();
+
+    res.json({
+      ok: true,
+      baseUrl,
+      model,
+      responsePreview: text.slice(0, 140),
+      message: 'Local provider responded successfully.',
+    });
+  } catch (err) {
+    const message = err?.message || 'Local provider health check failed.';
+    res.status(502).json({
+      ok: false,
+      baseUrl,
+      model,
+      error: message,
+    });
+  }
+});
+
+app.post('/api/providers/config', async (req, res) => {
+  try {
+    const nextCopilot = req.body?.copilot;
+    const nextCodex = req.body?.codex;
+    const nextLocal = req.body?.local;
+    let shouldReinitCopilot = false;
+
+    if (nextCopilot && typeof nextCopilot === 'object') {
+      if (typeof nextCopilot.authType === 'string') {
+        const authType = String(nextCopilot.authType).trim().toLowerCase();
+        if (!['logged-in-user', 'token'].includes(authType)) {
+          return res.status(400).json({ error: 'copilot.authType must be "logged-in-user" or "token".' });
+        }
+        if (runtimeProviderConfig.copilot.authType !== authType) {
+          runtimeProviderConfig.copilot.authType = authType;
+          shouldReinitCopilot = true;
+        }
+      }
+
+      if (typeof nextCopilot.token === 'string') {
+        runtimeProviderConfig.copilot.token = sealSecret(nextCopilot.token);
+        shouldReinitCopilot = true;
+      }
+    }
+
+    if (nextCodex && typeof nextCodex === 'object') {
+      if (typeof nextCodex.apiKey === 'string') {
+        runtimeProviderConfig.codex.apiKey = sealSecret(nextCodex.apiKey);
+      }
+      if (typeof nextCodex.baseUrl === 'string') {
+        runtimeProviderConfig.codex.baseUrl = nextCodex.baseUrl.trim() || 'https://api.openai.com/v1';
+      }
+      if (typeof nextCodex.model === 'string') {
+        runtimeProviderConfig.codex.model = nextCodex.model.trim() || 'gpt-5-codex';
+      }
+    }
+
+    if (nextLocal && typeof nextLocal === 'object') {
+      if (typeof nextLocal.apiKey === 'string') {
+        runtimeProviderConfig.local.apiKey = sealSecret(nextLocal.apiKey);
+      }
+      if (typeof nextLocal.baseUrl === 'string') {
+        runtimeProviderConfig.local.baseUrl = nextLocal.baseUrl.trim() || 'http://127.0.0.1:11434/v1';
+      }
+      if (typeof nextLocal.model === 'string') {
+        runtimeProviderConfig.local.model = nextLocal.model.trim() || 'qwen2.5-coder:latest';
+      }
+    }
+
+    if (shouldReinitCopilot) {
+      await initCopilotAgent();
+    }
+
+    res.json({ ok: true, providers: providerStatusPayload() });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || 'Failed to update provider config.' });
+  }
 });
 
 // =============================================================================
@@ -1720,6 +2398,28 @@ async function shutdown() {
 
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+
+process.on('uncaughtException', (err) => {
+  console.error('[fatal] uncaughtException:', err?.stack || err?.message || err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  const msg = reason?.stack || reason?.message || reason;
+  console.error('[fatal] unhandledRejection:', msg);
+});
+
+server.on('error', (err) => {
+  if (!err) return;
+
+  if (err.code === 'EADDRINUSE') {
+    console.error(`[server] Failed to bind ${HOST}:${PORT} - port already in use.`);
+    console.error('[server] Another PocketIDE-Server process may still be running.');
+  } else if (err.code === 'EACCES') {
+    console.error(`[server] Failed to bind ${HOST}:${PORT} - permission denied.`);
+  } else {
+    console.error('[server] Startup error:', err?.stack || err?.message || err);
+  }
+});
 
 // =============================================================================
 // Boot
