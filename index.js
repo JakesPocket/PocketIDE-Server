@@ -8,6 +8,76 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const util = require('util');
+
+function setupFileLogging(serviceName) {
+  const logsDir = process.env.LOG_DIR
+    ? path.resolve(process.env.LOG_DIR)
+    : path.resolve(__dirname, 'logs');
+
+  try {
+    fs.mkdirSync(logsDir, { recursive: true });
+  } catch (err) {
+    process.stderr.write(`[logging] failed to create log directory ${logsDir}: ${err.message}\n`);
+    return null;
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const fileName = process.env.LOG_FILE || `${serviceName}-${today}.log`;
+  const filePath = path.resolve(logsDir, fileName);
+
+  let stream;
+  try {
+    stream = fs.createWriteStream(filePath, { flags: 'a' });
+  } catch (err) {
+    process.stderr.write(`[logging] failed to open log file ${filePath}: ${err.message}\n`);
+    return null;
+  }
+
+  const original = {
+    log: console.log.bind(console),
+    info: console.info.bind(console),
+    warn: console.warn.bind(console),
+    error: console.error.bind(console),
+  };
+
+  const writeLine = (level, args) => {
+    try {
+      const timestamp = new Date().toISOString();
+      const message = util.format(...args);
+      stream.write(`[${timestamp}] [${level}] ${message}\n`);
+    } catch (_) {
+      // Do not break runtime logging if file writes fail.
+    }
+  };
+
+  console.log = (...args) => {
+    original.log(...args);
+    writeLine('LOG', args);
+  };
+  console.info = (...args) => {
+    original.info(...args);
+    writeLine('INFO', args);
+  };
+  console.warn = (...args) => {
+    original.warn(...args);
+    writeLine('WARN', args);
+  };
+  console.error = (...args) => {
+    original.error(...args);
+    writeLine('ERROR', args);
+  };
+
+  process.on('exit', (code) => {
+    writeLine('EXIT', [`process exiting with code ${code}`]);
+    stream.end();
+  });
+
+  original.log(`[logging] writing server logs to ${filePath}`);
+  return filePath;
+}
+
+setupFileLogging('server');
 
 function resolveWorkspacePath() {
   if (process.env.WORKSPACE && fs.existsSync(process.env.WORKSPACE)) {
@@ -97,9 +167,7 @@ const runtimeProviderConfig = {
     token: sealSecret(process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.COPILOT_GITHUB_TOKEN || ''),
   },
   codex: {
-    apiKey: sealSecret(process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY || ''),
-    baseUrl: process.env.CODEX_BASE_URL || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
-    model: process.env.CODEX_MODEL || 'gpt-5-codex',
+    model: process.env.CODEX_MODEL || 'codex-mini-latest',
   },
   local: {
     apiKey: sealSecret(process.env.LOCAL_AGENT_API_KEY || ''),
@@ -118,8 +186,32 @@ function normalizeProvider(value) {
   return 'copilot';
 }
 
-function resolveCodexApiKey() {
-  return unsealSecret(runtimeProviderConfig.codex.apiKey) || '';
+// Codex CLI helpers — cached to avoid repeated subprocess spawns per request
+let _codexCliInstalledCache = null;
+let _codexCliInstalledAt = 0;
+
+function checkCodexCliInstalled() {
+  const now = Date.now();
+  if (_codexCliInstalledCache !== null && now - _codexCliInstalledAt < 60_000) {
+    return _codexCliInstalledCache;
+  }
+  const result = require('child_process').spawnSync('which', ['codex'], { stdio: 'pipe' });
+  _codexCliInstalledCache = result.status === 0;
+  _codexCliInstalledAt = now;
+  return _codexCliInstalledCache;
+}
+
+function checkCodexCliAuth() {
+  // Accept OPENAI_API_KEY env var as a valid auth method for the CLI
+  if (process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY) return true;
+  // Check for Codex CLI auth/config files written by `codex auth`
+  const authPaths = [
+    path.join(os.homedir(), '.codex', 'auth.json'),
+    path.join(os.homedir(), '.codex', 'config.json'),
+    path.join(os.homedir(), '.config', 'codex', 'auth.json'),
+    path.join(os.homedir(), '.config', 'openai', 'auth.json'),
+  ];
+  return authPaths.some((p) => { try { return fs.existsSync(p); } catch { return false; } });
 }
 
 function resolveLocalApiKey() {
@@ -418,44 +510,54 @@ function resolveCopilotAuthConfig() {
 }
 
 async function streamCodexReply(prompt, sendEvent, mode = 'agent') {
-  const apiKey = resolveCodexApiKey();
-  if (!apiKey) {
-    throw new Error('Codex is not configured. Add an API key in Settings > Agent Controls > Provider Sign-in.');
+  if (!checkCodexCliInstalled()) {
+    throw new Error(
+      'Codex CLI is not installed. Install it with: npm install -g @openai/codex',
+    );
   }
 
-  const OpenAI = require('openai');
-  const client = new OpenAI({
-    apiKey,
-    baseURL: String(runtimeProviderConfig.codex.baseUrl || 'https://api.openai.com/v1').trim(),
+  const model = String(runtimeProviderConfig.codex.model || 'codex-mini-latest').trim();
+  // full-auto lets the CLI act without asking approval on each step; use suggest for ask/plan modes
+  const approvalMode = mode === 'agent' ? 'full-auto' : 'suggest';
+
+  return new Promise((resolve, reject) => {
+    const args = ['--approval-mode', approvalMode, '--model', model, prompt];
+
+    const proc = spawn('codex', args, {
+      cwd: WORKSPACE,
+      // NO_COLOR + TERM=dumb suppress ANSI escape sequences from the TUI output
+      env: { ...process.env, NO_COLOR: '1', TERM: 'dumb', CI: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let output = '';
+
+    proc.stdout.on('data', (data) => {
+      const chunk = data.toString();
+      output += chunk;
+      sendEvent({ type: 'message', content: chunk });
+    });
+
+    proc.stderr.on('data', (data) => {
+      console.error('[codex stderr]', data.toString().slice(0, 300));
+    });
+
+    proc.on('close', (code) => {
+      if (!output.trim() && code !== 0) {
+        reject(new Error(
+          'Codex CLI exited without output. Run `codex` in the terminal and authenticate with your ChatGPT account.',
+        ));
+      } else {
+        resolve(output);
+      }
+    });
+
+    proc.on('error', (err) => {
+      reject(new Error(
+        `Failed to launch Codex CLI: ${err.message}. Install with: npm install -g @openai/codex`,
+      ));
+    });
   });
-
-  const effectiveMode = String(mode || 'agent').toLowerCase().trim();
-  const systemByMode = effectiveMode === 'plan'
-    ? 'You are in PLAN mode. Do not run tools. Return only concise final user-facing text.'
-    : effectiveMode === 'ask'
-      ? 'You are in ASK mode. Explain intent before any potentially destructive suggestion and ask for explicit user confirmation.'
-      : 'You are in AGENT mode. Provide direct, actionable coding help.';
-
-  const result = await client.chat.completions.create({
-    model: String(runtimeProviderConfig.codex.model || 'gpt-5-codex').trim(),
-    temperature: 0.2,
-    messages: [
-      { role: 'system', content: systemByMode },
-      { role: 'user', content: prompt },
-    ],
-  });
-
-  const content = result?.choices?.[0]?.message?.content;
-  const text = Array.isArray(content)
-    ? content.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('').trim()
-    : String(content || '').trim();
-
-  if (!text) {
-    throw new Error('Codex returned an empty response.');
-  }
-
-  sendEvent({ type: 'message', content: text });
-  return text;
 }
 
 async function streamLocalReply(prompt, sendEvent, mode = 'agent') {
@@ -936,7 +1038,7 @@ app.post('/api/chat', async (req, res) => {
           ? 'Copilot auth is missing for the current mode. Use Provider Sign-in in Settings (logged-in user or token).'
           : provider === 'local'
             ? 'Local provider rejected auth. Verify Local base URL/API key in Settings > Provider Sign-in.'
-            : 'Codex auth is missing or invalid. Add a Codex API key in Settings > Provider Sign-in.',
+            : 'Codex CLI is not authenticated. Run `codex` in the terminal and log in with your ChatGPT account.',
       });
     } else {
       const isTimeout = /timeout|timed.?out/i.test(message);
@@ -1091,9 +1193,10 @@ app.get('/api/chat/runtime', (req, res) => {
         model: process.env.COPILOT_MODEL || 'gpt-5',
       },
       codex: {
-        ready: Boolean(resolveCodexApiKey()),
-        model: String(runtimeProviderConfig.codex.model || 'gpt-5-codex').trim(),
-        baseUrl: String(runtimeProviderConfig.codex.baseUrl || '').trim(),
+        ready: checkCodexCliInstalled() && checkCodexCliAuth(),
+        cliInstalled: checkCodexCliInstalled(),
+        authenticated: checkCodexCliAuth(),
+        model: String(runtimeProviderConfig.codex.model || 'codex-mini-latest').trim(),
       },
       local: {
         ready: Boolean(String(runtimeProviderConfig.local.baseUrl || '').trim() && String(runtimeProviderConfig.local.model || '').trim()),
@@ -1106,10 +1209,11 @@ app.get('/api/chat/runtime', (req, res) => {
 
 function providerStatusPayload() {
   const copilotToken = resolveGithubToken();
-  const codexKey = resolveCodexApiKey();
   const localKey = resolveLocalApiKey();
   const localBaseUrl = String(runtimeProviderConfig.local.baseUrl || '').trim();
   const localModel = String(runtimeProviderConfig.local.model || '').trim();
+  const codexInstalled = checkCodexCliInstalled();
+  const codexAuthed = checkCodexCliAuth();
   return {
     copilot: {
       authType: runtimeProviderConfig.copilot.authType,
@@ -1120,11 +1224,10 @@ function providerStatusPayload() {
       error: copilotInitError,
     },
     codex: {
-      ready: Boolean(codexKey),
-      apiKeyConfigured: Boolean(codexKey),
-      apiKeyPreview: redactSecret(codexKey),
-      baseUrl: String(runtimeProviderConfig.codex.baseUrl || '').trim(),
-      model: String(runtimeProviderConfig.codex.model || 'gpt-5-codex').trim(),
+      ready: codexInstalled && codexAuthed,
+      cliInstalled: codexInstalled,
+      authenticated: codexAuthed,
+      model: String(runtimeProviderConfig.codex.model || 'codex-mini-latest').trim(),
     },
     local: {
       ready: Boolean(localBaseUrl && localModel),
@@ -1141,6 +1244,56 @@ function providerStatusPayload() {
 
 app.get('/api/providers/status', (req, res) => {
   res.json({ providers: providerStatusPayload() });
+});
+
+// POST /api/providers/codex/login — spawn `codex auth` via PTY and stream output as SSE
+// so the user can complete the ChatGPT OAuth flow from the Settings panel.
+app.post('/api/providers/codex/login', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const sendSSE = (data) => {
+    if (!res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  if (!checkCodexCliInstalled()) {
+    sendSSE({ type: 'error', message: 'Codex CLI is not installed. Run: npm install -g @openai/codex' });
+    res.end();
+    return;
+  }
+
+  // Spawn `codex auth` in a PTY so the CLI can render its interactive login flow.
+  let ptyProc;
+  try {
+    ptyProc = pty.spawn('codex', ['auth'], {
+      name: 'xterm-color',
+      cols: 120,
+      rows: 30,
+      cwd: process.env.HOME || WORKSPACE,
+      env: process.env,
+    });
+  } catch (err) {
+    sendSSE({ type: 'error', message: `Failed to start Codex CLI: ${err.message}` });
+    res.end();
+    return;
+  }
+
+  ptyProc.onData((data) => {
+    sendSSE({ type: 'output', content: data });
+  });
+
+  ptyProc.onExit(({ exitCode }) => {
+    // Bust the installed-check cache so the next status poll re-reads auth state.
+    _codexCliInstalledAt = 0;
+    sendSSE({ type: 'done', exitCode });
+    if (!res.writableEnded) res.end();
+  });
+
+  req.on('close', () => {
+    try { ptyProc.kill(); } catch (_) {}
+  });
 });
 
 app.post('/api/providers/local/health', async (req, res) => {
@@ -1224,14 +1377,8 @@ app.post('/api/providers/config', async (req, res) => {
     }
 
     if (nextCodex && typeof nextCodex === 'object') {
-      if (typeof nextCodex.apiKey === 'string') {
-        runtimeProviderConfig.codex.apiKey = sealSecret(nextCodex.apiKey);
-      }
-      if (typeof nextCodex.baseUrl === 'string') {
-        runtimeProviderConfig.codex.baseUrl = nextCodex.baseUrl.trim() || 'https://api.openai.com/v1';
-      }
       if (typeof nextCodex.model === 'string') {
-        runtimeProviderConfig.codex.model = nextCodex.model.trim() || 'gpt-5-codex';
+        runtimeProviderConfig.codex.model = nextCodex.model.trim() || 'codex-mini-latest';
       }
     }
 
