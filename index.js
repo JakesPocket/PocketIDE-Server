@@ -34,7 +34,7 @@ let WORKSPACE = resolveWorkspacePath();
 const keepSnapshots = new Map();
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
-const TWO_MINUTES_MS = 2 * 60 * 1000;
+const REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 const TOOL_STEP_TIMEOUT_MS = 45 * 1000;
 const MAX_CONSECUTIVE_IDENTICAL_STEPS = 8;
 const MAX_TOOL_EXECUTIONS_PER_SIGNATURE = 14;
@@ -203,6 +203,37 @@ function enqueueCloudJob(jobId) {
   });
 }
 
+function formatAttachmentSize(bytes) {
+  if (typeof bytes !== 'number' || bytes <= 0) return '';
+  if (bytes < 1024) return ` ${bytes}B`;
+  if (bytes < 1024 * 1024) return ` ${(bytes / 1024).toFixed(1)}KB`;
+  return ` ${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+function buildAttachmentContext(attachments) {
+  if (!Array.isArray(attachments) || attachments.length === 0) return '';
+
+  const parts = [];
+  for (const att of attachments) {
+    if (!att || typeof att !== 'object') continue;
+    const name = typeof att.name === 'string' && att.name ? att.name : 'unnamed';
+    const data = typeof att.data === 'string' ? att.data : '';
+    const sizeHint = formatAttachmentSize(att.size);
+
+    if (att.isImage) {
+      parts.push(`[Attached image: ${name}${sizeHint} — image content not available in text mode]`);
+    } else if (att.isText && data) {
+      parts.push(`--- Attached file: ${name} ---\n${data}\n--- End of ${name} ---`);
+    } else if (data) {
+      parts.push(`[Attached file: ${name}${sizeHint} — binary content omitted]`);
+    } else {
+      parts.push(`[Attached file: ${name}${sizeHint}]`);
+    }
+  }
+
+  return parts.length > 0 ? `\n\n${parts.join('\n\n')}` : '';
+}
+
 function buildEnhancedPromptForMode(message, aiMode) {
   const mode = String(aiMode || 'agent').toLowerCase().trim();
 
@@ -346,7 +377,7 @@ async function processCloudJobQueue() {
         const metadata = err?.metadata || {};
 
         job.error = {
-          message: isTimeout ? 'Request timed out after 2 minutes.' : message,
+          message: isTimeout ? 'Request timed out after 5 minutes.' : message,
           isTimeout,
           isLoop: Boolean(metadata.isLoop),
         };
@@ -630,14 +661,14 @@ async function streamAgentReply(session, prompt, sendEvent, mode = 'agent') {
 
     let finalEvent;
     try {
-      finalEvent = await session.sendAndWait({ prompt }, TWO_MINUTES_MS);
+      finalEvent = await session.sendAndWait({ prompt }, REQUEST_TIMEOUT_MS);
     } catch (err) {
       if (sessionError) throw sessionError;
 
       const errMsg = err?.message || 'Unknown session error';
       if (/session\.idle|timeout|timed.?out/i.test(errMsg)) {
         const activeStepHint = activeStep ? ` Last active step: ${activeStep.tool}.` : '';
-        throw new Error(`Timeout after 2 minutes waiting for session.idle.${activeStepHint}`);
+        throw new Error(`Timeout after 5 minutes waiting for session.idle.${activeStepHint}`);
       }
       throw err;
     }
@@ -736,7 +767,7 @@ async function streamPlanReply(prompt, sendEvent) {
   });
 
   try {
-    const result = await planningSession.sendAndWait({ prompt }, TWO_MINUTES_MS);
+    const result = await planningSession.sendAndWait({ prompt }, REQUEST_TIMEOUT_MS);
     const content = typeof result?.data?.content === 'string' ? result.data.content.trim() : '';
     if (!content) {
       throw new Error('Plan mode returned an empty response.');
@@ -835,10 +866,12 @@ setInterval(cleanupCloudJobs, 10 * 60 * 1000);
 // =============================================================================
 
 app.post('/api/chat', async (req, res) => {
-  const { message, aiMode } = req.body;
+  const { message, aiMode, attachments } = req.body;
   const provider = normalizeProvider(req.body?.provider || 'copilot');
+  const attachmentContext = buildAttachmentContext(attachments);
+  const fullMessage = (message || '') + attachmentContext;
 
-  if (!message) {
+  if (!fullMessage.trim()) {
     return res.status(400).json({ error: 'Message is required' });
   }
 
@@ -852,7 +885,7 @@ app.post('/api/chat', async (req, res) => {
 
   // --- Build mode-aware prompt ---
   const mode = String(aiMode || 'agent').toLowerCase().trim();
-  const enhancedPrompt = buildEnhancedPromptForMode(message, mode);
+  const enhancedPrompt = buildEnhancedPromptForMode(fullMessage, mode);
 
   // --- Set up SSE streaming response ---
   res.setHeader('Content-Type', 'text/event-stream');
@@ -910,7 +943,7 @@ app.post('/api/chat', async (req, res) => {
       const metadata = err?.metadata || {};
       sendEvent({
         type: 'error',
-        message: isTimeout ? 'Request timed out after 2 minutes.' : message,
+        message: isTimeout ? 'Request timed out after 5 minutes.' : message,
         isTimeout,
         isLoop: Boolean(metadata.isLoop),
       });
@@ -926,8 +959,11 @@ app.post('/api/chat', async (req, res) => {
 // -----------------------------------------------------------------------------
 
 app.post('/api/jobs', (req, res) => {
-  const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
-  if (!message) {
+  const rawMessage = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+  const attachments = req.body?.attachments;
+  const attachmentContext = buildAttachmentContext(attachments);
+  const message = rawMessage + attachmentContext;
+  if (!message.trim()) {
     return res.status(400).json({ error: 'message is required' });
   }
 
@@ -1753,7 +1789,7 @@ async function generateAiCommitMessage(stagedFiles) {
   try {
     const result = await oneShotSession.sendAndWait({
       prompt: buildCommitMessagePrompt(stagedFiles),
-    }, TWO_MINUTES_MS);
+    }, REQUEST_TIMEOUT_MS);
 
     const message = extractSingleLineMessage(result?.data?.content || '');
     if (!message) {
@@ -2424,6 +2460,10 @@ server.on('error', (err) => {
 // =============================================================================
 // Boot
 // =============================================================================
+
+server.timeout = REQUEST_TIMEOUT_MS;
+server.headersTimeout = REQUEST_TIMEOUT_MS + 1000;
+server.requestTimeout = REQUEST_TIMEOUT_MS + 1000;
 
 server.listen(PORT, HOST, async () => {
   console.log(`[server] PocketIDE Server listening on ${HOST}:${PORT}`);
