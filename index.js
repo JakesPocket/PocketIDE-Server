@@ -104,12 +104,69 @@ let WORKSPACE = resolveWorkspacePath();
 const keepSnapshots = new Map();
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
-const REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+const REQUEST_TIMEOUT_MS = Number.parseInt(String(process.env.CHAT_REQUEST_TIMEOUT_MS || ''), 10) > 0
+  ? Number.parseInt(String(process.env.CHAT_REQUEST_TIMEOUT_MS), 10)
+  : 5 * 60 * 1000;
 const TOOL_STEP_TIMEOUT_MS = 45 * 1000;
 const MAX_CONSECUTIVE_IDENTICAL_STEPS = 8;
 const MAX_TOOL_EXECUTIONS_PER_SIGNATURE = 14;
 const CLOUD_JOB_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_CLOUD_JOB_EVENTS = 400;
+
+function isTerminalCloudJobStatus(status) {
+  return status === 'succeeded' || status === 'failed' || status === 'cancelled';
+}
+
+function cleanupCloudJobAttachmentFiles(job) {
+  if (!job || job._attachmentsCleaned) return;
+  const imagePaths = Array.isArray(job.imagePaths) ? job.imagePaths : [];
+  const parentDirs = new Set();
+
+  for (const p of imagePaths) {
+    if (typeof p !== 'string' || !p) continue;
+    parentDirs.add(path.dirname(p));
+    try {
+      fs.rmSync(p, { force: true });
+    } catch (_) {}
+  }
+
+  for (const dir of parentDirs) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch (_) {}
+  }
+
+  job._attachmentsCleaned = true;
+}
+
+function createChatRequestId() {
+  return `chat_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
+}
+
+function formatDurationMs(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value <= 0) return '0ms';
+  if (value < 1000) return `${Math.round(value)}ms`;
+  return `${(value / 1000).toFixed(1)}s`;
+}
+
+function isTimeoutError(err) {
+  if (!err) return false;
+  if (err?.metadata?.isTimeout) return true;
+  const message = err?.message || '';
+  return /session\.idle|timeout|timed.?out/i.test(message);
+}
+
+function createAbortError(message = 'Request cancelled by client.') {
+  const err = new Error(message);
+  err.name = 'AbortError';
+  err.metadata = { isCancelled: true };
+  return err;
+}
+
+function isAbortError(err) {
+  return err?.name === 'AbortError' || Boolean(err?.metadata?.isCancelled);
+}
 
 // Change server CWD to workspace so the Copilot CLI subprocess inherits it,
 // matching the same working environment as the node-pty bash shells.
@@ -167,7 +224,7 @@ const runtimeProviderConfig = {
     token: sealSecret(process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.COPILOT_GITHUB_TOKEN || ''),
   },
   codex: {
-    model: process.env.CODEX_MODEL || 'codex-mini-latest',
+    model: process.env.CODEX_MODEL || 'gpt-5.4',
   },
   local: {
     apiKey: sealSecret(process.env.LOCAL_AGENT_API_KEY || ''),
@@ -179,6 +236,124 @@ let copilotInitError = null;
 const cloudJobs = new Map();
 const cloudJobQueue = [];
 let cloudJobWorkerActive = false;
+const CLOUD_JOBS_STORE_PATH = process.env.CLOUD_JOBS_STORE_PATH
+  ? path.resolve(process.env.CLOUD_JOBS_STORE_PATH)
+  : path.resolve(__dirname, 'data', 'cloud-jobs.json');
+let cloudJobsPersistTimer = null;
+
+function serializeCloudJobsForStore() {
+  return {
+    version: 1,
+    savedAt: nowIso(),
+    jobs: [...cloudJobs.values()].map((job) => ({
+      id: job.id,
+      status: job.status,
+      provider: normalizeProvider(job.provider || 'copilot'),
+      aiMode: job.aiMode,
+      message: job.message,
+      turnId: job.turnId,
+      resultText: job.resultText || '',
+      error: job.error || null,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+      startedAt: job.startedAt,
+      finishedAt: job.finishedAt,
+      cancelRequested: Boolean(job.cancelRequested),
+      nextEventId: Number.isFinite(job.nextEventId) ? job.nextEventId : 0,
+      events: Array.isArray(job.events) ? job.events : [],
+      imagePaths: Array.isArray(job.imagePaths) ? job.imagePaths : [],
+    })),
+  };
+}
+
+function persistCloudJobsSync() {
+  try {
+    const dir = path.dirname(CLOUD_JOBS_STORE_PATH);
+    fs.mkdirSync(dir, { recursive: true });
+    const payload = JSON.stringify(serializeCloudJobsForStore(), null, 2);
+    const tmpPath = `${CLOUD_JOBS_STORE_PATH}.tmp`;
+    fs.writeFileSync(tmpPath, payload, 'utf8');
+    fs.renameSync(tmpPath, CLOUD_JOBS_STORE_PATH);
+  } catch (err) {
+    console.error('[cloud-jobs] persist failed:', err.message);
+  }
+}
+
+function schedulePersistCloudJobs() {
+  if (cloudJobsPersistTimer) return;
+  cloudJobsPersistTimer = setTimeout(() => {
+    cloudJobsPersistTimer = null;
+    persistCloudJobsSync();
+  }, 200);
+}
+
+function flushCloudJobsPersistence() {
+  if (cloudJobsPersistTimer) {
+    clearTimeout(cloudJobsPersistTimer);
+    cloudJobsPersistTimer = null;
+  }
+  persistCloudJobsSync();
+}
+
+function loadCloudJobsFromDisk() {
+  if (!fs.existsSync(CLOUD_JOBS_STORE_PATH)) return;
+
+  try {
+    const raw = fs.readFileSync(CLOUD_JOBS_STORE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    const jobs = Array.isArray(parsed?.jobs) ? parsed.jobs : [];
+
+    for (const stored of jobs) {
+      if (!stored || typeof stored !== 'object') continue;
+      const id = typeof stored.id === 'string' && stored.id ? stored.id : null;
+      if (!id) continue;
+
+      const events = Array.isArray(stored.events) ? stored.events : [];
+      const maxEventId = events.reduce((max, evt) => {
+        const value = Number(evt?.id || 0);
+        return Number.isFinite(value) ? Math.max(max, value) : max;
+      }, 0);
+
+      const originalStatus = typeof stored.status === 'string' ? stored.status : 'queued';
+      const resumable = originalStatus === 'queued' || originalStatus === 'running';
+      const status = resumable ? 'queued' : originalStatus;
+
+      const job = {
+        id,
+        status,
+        provider: normalizeProvider(stored.provider || 'copilot'),
+        aiMode: ['agent', 'ask', 'plan', 'cloud'].includes(stored.aiMode) ? stored.aiMode : 'cloud',
+        message: typeof stored.message === 'string' ? stored.message : '',
+        turnId: typeof stored.turnId === 'string' ? stored.turnId : null,
+        createdAt: typeof stored.createdAt === 'string' ? stored.createdAt : nowIso(),
+        updatedAt: nowIso(),
+        startedAt: typeof stored.startedAt === 'string' ? stored.startedAt : null,
+        finishedAt: resumable ? null : (typeof stored.finishedAt === 'string' ? stored.finishedAt : null),
+        resultText: typeof stored.resultText === 'string' ? stored.resultText : '',
+        error: stored.error && typeof stored.error === 'object' ? stored.error : null,
+        cancelRequested: Boolean(stored.cancelRequested),
+        nextEventId: Math.max(Number(stored.nextEventId || 0), maxEventId),
+        events,
+        imagePaths: Array.isArray(stored.imagePaths)
+          ? stored.imagePaths.filter((value) => typeof value === 'string' && value.trim())
+          : [],
+        _attachmentsCleaned: false,
+      };
+
+      cloudJobs.set(job.id, job);
+
+      if (resumable && !job.cancelRequested) {
+        enqueueCloudJob(job.id);
+      }
+    }
+
+    if (jobs.length > 0) {
+      console.log(`[cloud-jobs] restored ${jobs.length} job(s) from ${CLOUD_JOBS_STORE_PATH}`);
+    }
+  } catch (err) {
+    console.error('[cloud-jobs] failed to load persisted jobs:', err.message);
+  }
+}
 
 function normalizeProvider(value) {
   const provider = String(value || 'copilot').toLowerCase().trim();
@@ -247,11 +422,16 @@ function pushCloudJobEvent(job, type, data = {}) {
     job.events.splice(0, job.events.length - MAX_CLOUD_JOB_EVENTS);
   }
   job.updatedAt = evt.ts;
+  schedulePersistCloudJobs();
 }
 
 function setCloudJobStatus(job, status, extras = {}) {
   job.status = status;
   Object.assign(job, extras);
+  if (isTerminalCloudJobStatus(status)) {
+    cleanupCloudJobAttachmentFiles(job);
+    job.imagePaths = [];
+  }
   job.updatedAt = nowIso();
   pushCloudJobEvent(job, 'job.status', { status });
 }
@@ -278,13 +458,19 @@ function serializeCloudJob(job, includeEvents = false) {
 
 function cleanupCloudJobs() {
   const cutoff = Date.now() - CLOUD_JOB_RETENTION_MS;
+  let removed = 0;
   for (const [id, job] of cloudJobs.entries()) {
     if (!job.finishedAt) continue;
     const finished = Date.parse(job.finishedAt);
     if (!Number.isFinite(finished)) continue;
     if (finished < cutoff) {
+      cleanupCloudJobAttachmentFiles(job);
       cloudJobs.delete(id);
+      removed += 1;
     }
+  }
+  if (removed > 0) {
+    schedulePersistCloudJobs();
   }
 }
 
@@ -294,6 +480,9 @@ function enqueueCloudJob(jobId) {
     console.error('[cloud-jobs] queue processor error:', err);
   });
 }
+
+loadCloudJobsFromDisk();
+process.on('exit', flushCloudJobsPersistence);
 
 function formatAttachmentSize(bytes) {
   if (typeof bytes !== 'number' || bytes <= 0) return '';
@@ -313,7 +502,7 @@ function buildAttachmentContext(attachments) {
     const sizeHint = formatAttachmentSize(att.size);
 
     if (att.isImage) {
-      parts.push(`[Attached image: ${name}${sizeHint} — image content not available in text mode]`);
+      parts.push(`[Attached image: ${name}${sizeHint}]`);
     } else if (att.isText && data) {
       parts.push(`--- Attached file: ${name} ---\n${data}\n--- End of ${name} ---`);
     } else if (data) {
@@ -324,6 +513,91 @@ function buildAttachmentContext(attachments) {
   }
 
   return parts.length > 0 ? `\n\n${parts.join('\n\n')}` : '';
+}
+
+function mimeTypeToImageExtension(mimeType) {
+  const t = String(mimeType || '').toLowerCase().trim();
+  if (t === 'image/png') return '.png';
+  if (t === 'image/jpeg' || t === 'image/jpg') return '.jpg';
+  if (t === 'image/webp') return '.webp';
+  if (t === 'image/gif') return '.gif';
+  if (t === 'image/bmp') return '.bmp';
+  if (t === 'image/tiff') return '.tiff';
+  if (t === 'image/svg+xml') return '.svg';
+  return '.img';
+}
+
+function decodeDataUrl(dataUrl) {
+  const value = String(dataUrl || '');
+  const match = /^data:([^;,]+)(;[^,]*)?,(.*)$/s.exec(value);
+  if (!match) return null;
+
+  const mimeType = match[1] || 'application/octet-stream';
+  const meta = match[2] || '';
+  const rawData = match[3] || '';
+  const isBase64 = /;base64/i.test(meta);
+  if (!isBase64) return null;
+
+  try {
+    const buffer = Buffer.from(rawData.replace(/\s+/g, ''), 'base64');
+    return { mimeType, buffer };
+  } catch (_) {
+    return null;
+  }
+}
+
+function toSafeFilename(name, fallback = 'image') {
+  const raw = String(name || '').trim();
+  const base = path.basename(raw || fallback);
+  const safe = base.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/^\.+/, '');
+  return safe || fallback;
+}
+
+function prepareCodexImageInputs(attachments, requestId) {
+  if (!Array.isArray(attachments) || attachments.length === 0) {
+    return { imagePaths: [], cleanup: () => {} };
+  }
+
+  const imageItems = attachments.filter((att) => att && typeof att === 'object' && att.isImage && typeof att.data === 'string');
+  if (imageItems.length === 0) {
+    return { imagePaths: [], cleanup: () => {} };
+  }
+
+  const dir = path.join(WORKSPACE, '.pocketide-temp-attachments', requestId || `req_${Date.now().toString(36)}`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  const imagePaths = [];
+  let wroteAny = false;
+
+  for (let i = 0; i < imageItems.length; i += 1) {
+    const att = imageItems[i];
+    const decoded = decodeDataUrl(att.data);
+    if (!decoded) continue;
+
+    const fallbackExt = mimeTypeToImageExtension(decoded.mimeType);
+    const requestedName = toSafeFilename(att.name, `image_${i + 1}${fallbackExt}`);
+    const requestedExt = path.extname(requestedName) || fallbackExt;
+    const baseName = path.basename(requestedName, path.extname(requestedName));
+    const fileName = `${String(i + 1).padStart(2, '0')}-${baseName}${requestedExt}`;
+    const filePath = path.join(dir, fileName);
+
+    try {
+      fs.writeFileSync(filePath, decoded.buffer);
+      imagePaths.push(filePath);
+      wroteAny = true;
+    } catch (err) {
+      console.warn(`[attachments] failed to write image ${fileName}: ${err.message}`);
+    }
+  }
+
+  const cleanup = () => {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch (_) {}
+  };
+
+  if (!wroteAny) cleanup();
+  return { imagePaths, cleanup };
 }
 
 function buildEnhancedPromptForMode(message, aiMode) {
@@ -381,7 +655,13 @@ async function runSingleCloudJob(job) {
   }
 
   if (provider === 'codex') {
-    const finalMessage = await streamCodexReply(enhancedPrompt, sendEvent, effectiveMode);
+    const finalMessage = await streamCodexReply(
+      enhancedPrompt,
+      sendEvent,
+      effectiveMode,
+      undefined,
+      { imagePaths: job.imagePaths || [] },
+    );
     return finalMessage;
   }
 
@@ -469,7 +749,7 @@ async function processCloudJobQueue() {
         const metadata = err?.metadata || {};
 
         job.error = {
-          message: isTimeout ? 'Request timed out after 5 minutes.' : message,
+          message: isTimeout ? `Request timed out after ${formatDurationMs(REQUEST_TIMEOUT_MS)}.` : message,
           isTimeout,
           isLoop: Boolean(metadata.isLoop),
         };
@@ -509,33 +789,90 @@ function resolveCopilotAuthConfig() {
   return { mode: 'logged-in-user', config: { useLoggedInUser: true } };
 }
 
-async function streamCodexReply(prompt, sendEvent, mode = 'agent') {
+async function streamCodexReply(prompt, sendEvent, mode = 'agent', signal, options = {}) {
   if (!checkCodexCliInstalled()) {
     throw new Error(
       'Codex CLI is not installed. Install it with: npm install -g @openai/codex',
     );
   }
 
-  const model = String(runtimeProviderConfig.codex.model || 'codex-mini-latest').trim();
-  // full-auto lets the CLI act without asking approval on each step; use suggest for ask/plan modes
-  const approvalMode = mode === 'agent' ? 'full-auto' : 'suggest';
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
+
+  const useModel = String(runtimeProviderConfig.codex.model || 'gpt-5.4').trim();
+  const imagePaths = Array.isArray(options?.imagePaths) ? options.imagePaths.filter((p) => typeof p === 'string' && p) : [];
 
   return new Promise((resolve, reject) => {
-    const args = ['--approval-mode', approvalMode, '--model', model, prompt];
+    let settled = false;
+    // Use `codex exec --json` for non-interactive headless execution.
+    // --json:               emit JSONL events to stdout (avoids TUI / TTY requirement)
+    // --full-auto:          run without approval prompts
+    // --skip-git-repo-check: allow running outside a git repo
+    // --ephemeral:          don't persist session files to disk
+    const args = ['exec', '--full-auto', '--skip-git-repo-check', '--ephemeral', '--json', '--model', useModel];
+    for (const imagePath of imagePaths) {
+      args.push('--image', imagePath);
+    }
+    args.push(prompt);
 
     const proc = spawn('codex', args, {
       cwd: WORKSPACE,
-      // NO_COLOR + TERM=dumb suppress ANSI escape sequences from the TUI output
       env: { ...process.env, NO_COLOR: '1', TERM: 'dumb', CI: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    let output = '';
+    let outputText = '';
+    let lineBuffer = '';
+
+    // Parse JSONL events emitted by --json flag and stream agent_message text
+    const processJsonlLine = (line) => {
+      line = line.trim();
+      if (!line) return;
+      try {
+        const evt = JSON.parse(line);
+        if (evt.type === 'item.completed' && evt.item?.type === 'agent_message') {
+          const text = String(evt.item.text || '');
+          if (text) {
+            outputText += (outputText ? '\n' : '') + text;
+            sendEvent({ type: 'message', content: text });
+          }
+        } else if (evt.type === 'error') {
+          const msg = evt.message || JSON.stringify(evt);
+          console.error('[codex error event]', msg);
+        }
+      } catch (_) {
+        // not valid JSON — ignore metadata lines
+      }
+    };
+
+    const finishReject = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+
+    const finishResolve = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+
+    const onAbort = () => {
+      try { proc.kill('SIGTERM'); } catch (_) {}
+      finishReject(createAbortError());
+    };
+
+    if (signal) {
+      if (signal.aborted) { onAbort(); return; }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
 
     proc.stdout.on('data', (data) => {
-      const chunk = data.toString();
-      output += chunk;
-      sendEvent({ type: 'message', content: chunk });
+      lineBuffer += data.toString();
+      const lines = lineBuffer.split('\n');
+      lineBuffer = lines.pop(); // keep incomplete last line
+      for (const line of lines) processJsonlLine(line);
     });
 
     proc.stderr.on('data', (data) => {
@@ -543,27 +880,36 @@ async function streamCodexReply(prompt, sendEvent, mode = 'agent') {
     });
 
     proc.on('close', (code) => {
-      if (!output.trim() && code !== 0) {
-        reject(new Error(
-          'Codex CLI exited without output. Run `codex` in the terminal and authenticate with your ChatGPT account.',
+      if (signal) signal.removeEventListener('abort', onAbort);
+      // flush any remaining buffered line
+      if (lineBuffer.trim()) processJsonlLine(lineBuffer);
+      if (settled) return;
+      if (!outputText.trim() && code !== 0) {
+        finishReject(new Error(
+          'Codex CLI exited without output. Ensure you are logged in via Settings > Provider Sign-in.',
         ));
       } else {
-        resolve(output);
+        finishResolve(outputText);
       }
     });
 
     proc.on('error', (err) => {
-      reject(new Error(
+      if (signal) signal.removeEventListener('abort', onAbort);
+      finishReject(new Error(
         `Failed to launch Codex CLI: ${err.message}. Install with: npm install -g @openai/codex`,
       ));
     });
   });
 }
 
-async function streamLocalReply(prompt, sendEvent, mode = 'agent') {
+async function streamLocalReply(prompt, sendEvent, mode = 'agent', signal) {
   const baseUrl = String(runtimeProviderConfig.local.baseUrl || '').trim();
   const model = String(runtimeProviderConfig.local.model || '').trim();
   const apiKey = resolveLocalApiKey();
+
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
 
   if (!baseUrl || !model) {
     throw new Error('Local provider is not configured. Set Local base URL and model in Settings > Provider Sign-in.');
@@ -598,6 +944,10 @@ async function streamLocalReply(prompt, sendEvent, mode = 'agent') {
 
   if (!text) {
     throw new Error('Local provider returned an empty response.');
+  }
+
+  if (signal?.aborted) {
+    throw createAbortError();
   }
 
   sendEvent({ type: 'message', content: text });
@@ -637,16 +987,22 @@ function shouldRecreateAgentSession(err) {
   return /session not found/i.test(message) || /unknown session/i.test(message);
 }
 
-async function streamAgentReply(session, prompt, sendEvent, mode = 'agent') {
+async function streamAgentReply(session, prompt, sendEvent, mode = 'agent', signal) {
   const unsubs = [];
   let sawAssistantText = false;
   let lastAssistantMessage = '';
   let sessionError = null;
   let watchdogId = null;
   let activeStep = null;
+  let onAbort = null;
+  let announcedWriting = false;
   let lastStepSignature = '';
   let consecutiveStepCount = 0;
   const stepExecutionCounts = new Map();
+
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
 
   function serializeStepInput(input) {
     if (input == null) return 'null';
@@ -668,6 +1024,11 @@ async function streamAgentReply(session, prompt, sendEvent, mode = 'agent') {
   }
 
   try {
+    onAbort = () => {
+      abortSessionRun('Request cancelled by client.', { isCancelled: true, activeStep: activeStep?.tool || null });
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+
     watchdogId = setInterval(() => {
       if (!activeStep || sessionError) return;
       const elapsedMs = Date.now() - activeStep.startedAt;
@@ -687,6 +1048,10 @@ async function streamAgentReply(session, prompt, sendEvent, mode = 'agent') {
       }
 
       if (type === 'assistant.message_delta' && typeof data.deltaContent === 'string' && data.deltaContent) {
+        if (!announcedWriting) {
+          sendEvent({ type: 'progress', stage: 'writing', label: 'Writing response...' });
+          announcedWriting = true;
+        }
         sawAssistantText = true;
         sendEvent({ type: 'delta', content: data.deltaContent });
         return;
@@ -738,6 +1103,8 @@ async function streamAgentReply(session, prompt, sendEvent, mode = 'agent') {
           startedAt: Date.now(),
         };
 
+        sendEvent({ type: 'progress', stage: 'tool', label: `Running ${tool}...`, tool });
+
         sendEvent({
           type: 'tool_call',
           tool,
@@ -747,10 +1114,12 @@ async function streamAgentReply(session, prompt, sendEvent, mode = 'agent') {
       }
 
       if (type === 'tool.execution_complete') {
+        const completedTool = data.toolName || 'unknown_tool';
         activeStep = null;
+        sendEvent({ type: 'progress', stage: 'thinking', label: `Completed ${completedTool}.`, tool: completedTool });
         sendEvent({
           type: 'tool_result',
-          tool: data.toolName || 'unknown_tool',
+          tool: completedTool,
           output: data.result ?? data.error ?? null,
         });
         return;
@@ -770,7 +1139,12 @@ async function streamAgentReply(session, prompt, sendEvent, mode = 'agent') {
       const errMsg = err?.message || 'Unknown session error';
       if (/session\.idle|timeout|timed.?out/i.test(errMsg)) {
         const activeStepHint = activeStep ? ` Last active step: ${activeStep.tool}.` : '';
-        throw new Error(`Timeout after 5 minutes waiting for session.idle.${activeStepHint}`);
+        const timeoutErr = new Error(`Timeout after ${formatDurationMs(REQUEST_TIMEOUT_MS)} waiting for session.idle.${activeStepHint}`);
+        timeoutErr.metadata = {
+          isTimeout: true,
+          activeStep: activeStep ? activeStep.tool : null,
+        };
+        throw timeoutErr;
       }
       throw err;
     }
@@ -785,6 +1159,7 @@ async function streamAgentReply(session, prompt, sendEvent, mode = 'agent') {
     }
   } finally {
     if (watchdogId) clearInterval(watchdogId);
+    if (signal && onAbort) signal.removeEventListener('abort', onAbort);
     unsubs.forEach((u) => u());
   }
 }
@@ -972,21 +1347,34 @@ app.post('/api/chat', async (req, res) => {
   const provider = normalizeProvider(req.body?.provider || 'copilot');
   const attachmentContext = buildAttachmentContext(attachments);
   const fullMessage = (message || '') + attachmentContext;
+  const requestId = createChatRequestId();
+  const startedAt = Date.now();
+  const attachmentCount = Array.isArray(attachments) ? attachments.length : 0;
+  const mode = String(aiMode || 'agent').toLowerCase().trim();
+  const requestAbortController = new AbortController();
+  const { signal: requestSignal } = requestAbortController;
+  let clientDisconnected = false;
+
+  console.log(
+    `[chat] request.start id=${requestId} provider=${provider} mode=${mode} chars=${fullMessage.length} attachments=${attachmentCount}`,
+  );
 
   if (!fullMessage.trim()) {
+    console.warn(`[chat] request.reject id=${requestId} reason=empty_message`);
     return res.status(400).json({ error: 'Message is required' });
   }
 
   if (provider === 'copilot' && !agentSession) {
+    console.warn(`[chat] request.reject id=${requestId} provider=copilot reason=session_unavailable`);
     return res.status(503).json({ error: 'Copilot agent not initialised. Check Copilot auth/login for the selected auth mode.' });
   }
 
   if (provider === 'copilot' && agentBusy) {
+    console.warn(`[chat] request.reject id=${requestId} provider=copilot reason=agent_busy`);
     return res.status(429).json({ error: 'Agent is busy processing a previous request.' });
   }
 
   // --- Build mode-aware prompt ---
-  const mode = String(aiMode || 'agent').toLowerCase().trim();
   const enhancedPrompt = buildEnhancedPromptForMode(fullMessage, mode);
 
   // --- Set up SSE streaming response ---
@@ -996,39 +1384,111 @@ app.post('/api/chat', async (req, res) => {
   res.flushHeaders();
 
   const sendEvent = (payload) => {
-    if (!res.writableEnded) {
+    if (!res.writableEnded && !clientDisconnected) {
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
     }
   };
+
+  const emitProgress = (stage, label, extra = {}) => {
+    sendEvent({ type: 'progress', requestId, stage, label, ...extra });
+  };
+
+  const onClientClose = () => {
+    if (res.writableEnded || clientDisconnected) return;
+    clientDisconnected = true;
+    requestAbortController.abort();
+    console.warn(`[chat] request.cancelled id=${requestId} reason=client_disconnected`);
+  };
+  res.on('close', onClientClose);
+
+  // Keep the stream warm so proxies/clients can distinguish hung requests.
+  const heartbeat = setInterval(() => {
+    sendEvent({ type: 'heartbeat', requestId, stage: quietStage, ts: nowIso() });
+  }, 15000);
+
+  let quietStage = 'starting';
+  emitProgress('starting', 'Preparing request...');
 
   if (provider === 'copilot') agentBusy = true;
   try {
     try {
       if (provider === 'codex') {
-        await streamCodexReply(enhancedPrompt, sendEvent, mode);
+        quietStage = 'provider';
+        emitProgress('provider', 'Launching Codex CLI...');
+        const codexInputs = prepareCodexImageInputs(attachments, requestId);
+        try {
+          await streamCodexReply(
+            enhancedPrompt,
+            sendEvent,
+            mode,
+            requestSignal,
+            { imagePaths: codexInputs.imagePaths },
+          );
+        } finally {
+          codexInputs.cleanup();
+        }
       } else if (provider === 'local') {
-        await streamLocalReply(enhancedPrompt, sendEvent, mode);
+        quietStage = 'provider';
+        emitProgress('provider', 'Waiting for local provider...');
+        await streamLocalReply(enhancedPrompt, sendEvent, mode, requestSignal);
       } else if (mode === 'plan') {
+        quietStage = 'planning';
+        emitProgress('planning', 'Building plan...');
         if (isPlanExecutionIntent(message)) {
           sendEvent({ type: 'message', content: buildPlanModeHandoffMessage() });
         } else {
           await streamPlanReply(enhancedPrompt, sendEvent);
         }
       } else {
-        await streamAgentReply(agentSession, enhancedPrompt, sendEvent, mode);
+        quietStage = 'agent';
+        emitProgress('agent', 'Running agent...');
+        await streamAgentReply(agentSession, enhancedPrompt, sendEvent, mode, requestSignal);
       }
     } catch (err) {
-      if (provider !== 'copilot' || mode === 'plan' || !shouldRecreateAgentSession(err)) throw err;
+      if (provider !== 'copilot' || mode === 'plan') throw err;
 
-      console.warn('[copilot] session invalid, recreating and retrying once');
-      sendEvent({ type: 'tool_call', tool: 'copilot.session.reset', input: null });
-      await createAgentSession();
-      sendEvent({ type: 'tool_result', tool: 'copilot.session.reset', output: { ok: true, sessionId: agentSession.sessionId } });
-      await streamAgentReply(agentSession, enhancedPrompt, sendEvent, mode);
+      if (isAbortError(err)) throw err;
+
+      if (isTimeoutError(err)) {
+        const activeStep = err?.metadata?.activeStep || 'none';
+        if (activeStep === 'none') {
+          console.warn(
+            `[chat] request.timeout id=${requestId} activeStep=${activeStep} action=session_reset_and_retry`,
+          );
+          sendEvent({ type: 'tool_call', tool: 'copilot.session.reset', input: { reason: 'timeout', requestId } });
+          await createAgentSession();
+          sendEvent({ type: 'tool_result', tool: 'copilot.session.reset', output: { ok: true, sessionId: agentSession.sessionId, requestId } });
+          quietStage = 'agent';
+          emitProgress('agent', 'Retrying request after timeout...');
+          await streamAgentReply(agentSession, enhancedPrompt, sendEvent, mode, requestSignal);
+        } else {
+          console.warn(
+            `[chat] request.timeout id=${requestId} activeStep=${activeStep} action=no_auto_retry`,
+          );
+          throw err;
+        }
+      } else if (shouldRecreateAgentSession(err)) {
+        console.warn('[copilot] session invalid, recreating and retrying once');
+        sendEvent({ type: 'tool_call', tool: 'copilot.session.reset', input: null });
+        await createAgentSession();
+        sendEvent({ type: 'tool_result', tool: 'copilot.session.reset', output: { ok: true, sessionId: agentSession.sessionId } });
+        quietStage = 'agent';
+        emitProgress('agent', 'Retrying with fresh session...');
+        await streamAgentReply(agentSession, enhancedPrompt, sendEvent, mode, requestSignal);
+      } else {
+        throw err;
+      }
     }
 
+    console.log(`[chat] request.success id=${requestId} provider=${provider} mode=${mode} duration=${formatDurationMs(Date.now() - startedAt)}`);
+    emitProgress('done', 'Completed.');
     sendEvent({ type: 'done' });
   } catch (err) {
+    if (isAbortError(err) || requestSignal.aborted) {
+      console.warn(`[chat] request.aborted id=${requestId} provider=${provider} mode=${mode} duration=${formatDurationMs(Date.now() - startedAt)}`);
+      return;
+    }
+
     console.error('[copilot] chat error:', err);
     const message = err?.message || 'Unknown chat error';
     if (/authentication info|custom provider|401|unauthorized|api key/i.test(message)) {
@@ -1045,14 +1505,18 @@ app.post('/api/chat', async (req, res) => {
       const metadata = err?.metadata || {};
       sendEvent({
         type: 'error',
-        message: isTimeout ? 'Request timed out after 5 minutes.' : message,
+        message: isTimeout ? `Request timed out after ${formatDurationMs(REQUEST_TIMEOUT_MS)}.` : message,
         isTimeout,
         isLoop: Boolean(metadata.isLoop),
+        requestId,
       });
     }
+    console.error(`[chat] request.failed id=${requestId} provider=${provider} mode=${mode} duration=${formatDurationMs(Date.now() - startedAt)} reason=${message}`);
   } finally {
+    clearInterval(heartbeat);
+    res.off('close', onClientClose);
     if (provider === 'copilot') agentBusy = false;
-    res.end();
+    if (!res.writableEnded) res.end();
   }
 });
 
@@ -1073,9 +1537,13 @@ app.post('/api/jobs', (req, res) => {
   const aiMode = ['agent', 'ask', 'plan', 'cloud'].includes(rawMode) ? rawMode : 'cloud';
   const provider = normalizeProvider(req.body?.provider || 'copilot');
   const turnId = typeof req.body?.turnId === 'string' && req.body.turnId.trim() ? req.body.turnId.trim() : null;
+  const jobId = createCloudJobId();
+  const codexInputs = provider === 'codex'
+    ? prepareCodexImageInputs(attachments, jobId)
+    : { imagePaths: [], cleanup: () => {} };
 
   const job = {
-    id: createCloudJobId(),
+    id: jobId,
     status: 'queued',
     provider,
     aiMode,
@@ -1090,7 +1558,13 @@ app.post('/api/jobs', (req, res) => {
     cancelRequested: false,
     nextEventId: 0,
     events: [],
+    imagePaths: codexInputs.imagePaths,
+    _attachmentsCleaned: false,
   };
+
+  if (provider !== 'codex') {
+    codexInputs.cleanup();
+  }
 
   cloudJobs.set(job.id, job);
   pushCloudJobEvent(job, 'job.created', {
@@ -1196,7 +1670,7 @@ app.get('/api/chat/runtime', (req, res) => {
         ready: checkCodexCliInstalled() && checkCodexCliAuth(),
         cliInstalled: checkCodexCliInstalled(),
         authenticated: checkCodexCliAuth(),
-        model: String(runtimeProviderConfig.codex.model || 'codex-mini-latest').trim(),
+        model: String(runtimeProviderConfig.codex.model || 'gpt-5.4').trim(),
       },
       local: {
         ready: Boolean(String(runtimeProviderConfig.local.baseUrl || '').trim() && String(runtimeProviderConfig.local.model || '').trim()),
@@ -1227,7 +1701,7 @@ function providerStatusPayload() {
       ready: codexInstalled && codexAuthed,
       cliInstalled: codexInstalled,
       authenticated: codexAuthed,
-      model: String(runtimeProviderConfig.codex.model || 'codex-mini-latest').trim(),
+      model: String(runtimeProviderConfig.codex.model || 'gpt-5.4').trim(),
     },
     local: {
       ready: Boolean(localBaseUrl && localModel),
@@ -1246,8 +1720,8 @@ app.get('/api/providers/status', (req, res) => {
   res.json({ providers: providerStatusPayload() });
 });
 
-// POST /api/providers/codex/login — spawn `codex auth` via PTY and stream output as SSE
-// so the user can complete the ChatGPT OAuth flow from the Settings panel.
+// POST /api/providers/codex/login — run phone-friendly device auth and stream
+// plain text output via SSE so mobile users can complete login externally.
 app.post('/api/providers/codex/login', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -1258,21 +1732,27 @@ app.post('/api/providers/codex/login', (req, res) => {
     if (!res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
 
+  const cleanCliText = (value) => String(value || '')
+    // CSI sequences
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    // OSC sequences
+    .replace(/\u001b\][^\u0007]*(\u0007|\u001b\\)/g, '')
+    // Remaining ESC-prefixed sequences
+    .replace(/\u001b[@-Z\\-_]/g, '');
+
   if (!checkCodexCliInstalled()) {
     sendSSE({ type: 'error', message: 'Codex CLI is not installed. Run: npm install -g @openai/codex' });
     res.end();
     return;
   }
 
-  // Spawn `codex auth` in a PTY so the CLI can render its interactive login flow.
-  let ptyProc;
+  // Device auth avoids local TUI prompts and works cleanly for phone flows.
+  let proc;
   try {
-    ptyProc = pty.spawn('codex', ['auth'], {
-      name: 'xterm-color',
-      cols: 120,
-      rows: 30,
+    proc = spawn('codex', ['login', '--device-auth'], {
       cwd: process.env.HOME || WORKSPACE,
-      env: process.env,
+      env: { ...process.env, NO_COLOR: '1', TERM: 'dumb', CI: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
   } catch (err) {
     sendSSE({ type: 'error', message: `Failed to start Codex CLI: ${err.message}` });
@@ -1280,19 +1760,35 @@ app.post('/api/providers/codex/login', (req, res) => {
     return;
   }
 
-  ptyProc.onData((data) => {
-    sendSSE({ type: 'output', content: data });
+  let sawOutput = false;
+
+  const onData = (chunk) => {
+    const text = cleanCliText(chunk);
+    if (!text) return;
+    sawOutput = true;
+    sendSSE({ type: 'output', content: text });
+  };
+
+  proc.stdout.on('data', onData);
+  proc.stderr.on('data', onData);
+
+  proc.on('error', (err) => {
+    sendSSE({ type: 'error', message: `Codex login failed: ${err.message}` });
+    if (!res.writableEnded) res.end();
   });
 
-  ptyProc.onExit(({ exitCode }) => {
+  proc.on('close', (exitCode) => {
     // Bust the installed-check cache so the next status poll re-reads auth state.
     _codexCliInstalledAt = 0;
+    if (!sawOutput) {
+      sendSSE({ type: 'error', message: 'Codex login exited without output. Try running `codex login --device-auth` in the terminal.' });
+    }
     sendSSE({ type: 'done', exitCode });
     if (!res.writableEnded) res.end();
   });
 
   req.on('close', () => {
-    try { ptyProc.kill(); } catch (_) {}
+    try { proc.kill('SIGTERM'); } catch (_) {}
   });
 });
 
@@ -1378,7 +1874,7 @@ app.post('/api/providers/config', async (req, res) => {
 
     if (nextCodex && typeof nextCodex === 'object') {
       if (typeof nextCodex.model === 'string') {
-        runtimeProviderConfig.codex.model = nextCodex.model.trim() || 'codex-mini-latest';
+        runtimeProviderConfig.codex.model = nextCodex.model.trim() || 'gpt-5.4';
       }
     }
 
