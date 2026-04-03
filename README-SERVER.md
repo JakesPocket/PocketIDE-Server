@@ -1,6 +1,6 @@
-# PocketIDE Server
+# PocketCode Server
 
-Backend server for PocketIDE with GitHub Copilot SDK integration, terminal streaming via socket.io, and Codespace PWA support.
+Backend server for PocketCode with GitHub Copilot SDK integration, terminal streaming via socket.io, and Codespace PWA support.
 
 ## Features
 
@@ -39,8 +39,8 @@ npm start
 docker-compose up
 
 # Or build manually
-docker build -t pocketide-server .
-docker run -p 3000:3000 -v $(pwd):/workspace pocketide-server
+docker build -t pocketcode-server .
+docker run -p 3000:3000 -v $(pwd):/workspace pocketcode-server
 ```
 
 ## Environment Variables

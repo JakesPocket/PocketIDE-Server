@@ -1,7 +1,7 @@
 {
-  "name": "pocketide-server",
+  "name": "pocketcode-server",
   "version": "1.0.0",
-  "description": "Backend server for PocketIDE with GitHub Copilot SDK integration",
+  "description": "Backend server for PocketCode with GitHub Copilot SDK integration",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
@@ -10,7 +10,7 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
-    "pocketide",
+    "pocketcode",
     "terminal",
     "copilot"
   ],

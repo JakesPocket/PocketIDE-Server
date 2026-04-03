@@ -85,9 +85,9 @@ function resolveWorkspacePath() {
   }
 
   const cwd = process.cwd();
-  const siblingPocketIDE = path.resolve(cwd, '..', 'PocketIDE');
-  if (fs.existsSync(siblingPocketIDE)) {
-    return siblingPocketIDE;
+  const siblingPocketCode = path.resolve(cwd, '..', 'PocketCode');
+  if (fs.existsSync(siblingPocketCode)) {
+    return siblingPocketCode;
   }
 
   if (fs.existsSync('/workspace')) {
@@ -112,6 +112,7 @@ const MAX_CONSECUTIVE_IDENTICAL_STEPS = 8;
 const MAX_TOOL_EXECUTIONS_PER_SIGNATURE = 14;
 const CLOUD_JOB_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_CLOUD_JOB_EVENTS = 400;
+let isShuttingDown = false;
 
 function isTerminalCloudJobStatus(status) {
   return status === 'succeeded' || status === 'failed' || status === 'cancelled';
@@ -150,6 +151,16 @@ function formatDurationMs(ms) {
   return `${(value / 1000).toFixed(1)}s`;
 }
 
+function buildRuntimeContext() {
+  return {
+    pid: process.pid,
+    ppid: process.ppid,
+    uptimeSec: Math.round(process.uptime()),
+    workspace: WORKSPACE,
+    activeShells: shells?.size || 0,
+  };
+}
+
 function isTimeoutError(err) {
   if (!err) return false;
   if (err?.metadata?.isTimeout) return true;
@@ -182,7 +193,7 @@ let agentBusy = false; // guard against concurrent sends on the same session
 let activeCopilotAuthMode = 'unknown';
 const providerSecretKey = crypto
   .createHash('sha256')
-  .update(String(process.env.PROVIDER_SECRET_KEY || process.env.POCKETIDE_PROVIDER_SECRET_KEY || `${os.hostname()}:${process.pid}`))
+  .update(String(process.env.PROVIDER_SECRET_KEY || process.env.POCKETCODE_PROVIDER_SECRET_KEY || `${os.hostname()}:${process.pid}`))
   .digest();
 
 function sealSecret(value) {
@@ -222,6 +233,7 @@ const runtimeProviderConfig = {
   copilot: {
     authType: String(process.env.COPILOT_AUTH_MODE || 'logged-in-user').trim().toLowerCase() === 'token' ? 'token' : 'logged-in-user',
     token: sealSecret(process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.COPILOT_GITHUB_TOKEN || ''),
+    model: process.env.COPILOT_MODEL || 'claude-sonnet-4.5',
   },
   codex: {
     model: process.env.CODEX_MODEL || 'gpt-5.4',
@@ -365,6 +377,10 @@ function normalizeProvider(value) {
 let _codexCliInstalledCache = null;
 let _codexCliInstalledAt = 0;
 
+// GitHub CLI helpers
+let _ghCliInstalledCache = null;
+let _ghCliInstalledAt = 0;
+
 function checkCodexCliInstalled() {
   const now = Date.now();
   if (_codexCliInstalledCache !== null && now - _codexCliInstalledAt < 60_000) {
@@ -387,6 +403,17 @@ function checkCodexCliAuth() {
     path.join(os.homedir(), '.config', 'openai', 'auth.json'),
   ];
   return authPaths.some((p) => { try { return fs.existsSync(p); } catch { return false; } });
+}
+
+function checkGhCliInstalled() {
+  const now = Date.now();
+  if (_ghCliInstalledCache !== null && now - _ghCliInstalledAt < 60_000) {
+    return _ghCliInstalledCache;
+  }
+  const result = require('child_process').spawnSync('which', ['gh'], { stdio: 'pipe' });
+  _ghCliInstalledCache = result.status === 0;
+  _ghCliInstalledAt = now;
+  return _ghCliInstalledCache;
 }
 
 function resolveLocalApiKey() {
@@ -563,7 +590,7 @@ function prepareCodexImageInputs(attachments, requestId) {
     return { imagePaths: [], cleanup: () => {} };
   }
 
-  const dir = path.join(WORKSPACE, '.pocketide-temp-attachments', requestId || `req_${Date.now().toString(36)}`);
+  const dir = path.join(WORKSPACE, '.pocketcode-temp-attachments', requestId || `req_${Date.now().toString(36)}`);
   fs.mkdirSync(dir, { recursive: true });
 
   const imagePaths = [];
@@ -957,7 +984,7 @@ async function streamLocalReply(prompt, sendEvent, mode = 'agent', signal) {
 function buildAgentSessionOptions() {
   const { approveAll } = require('@github/copilot-sdk');
   return {
-    model: process.env.COPILOT_MODEL || 'gpt-5',
+    model: runtimeProviderConfig.copilot.model || 'claude-sonnet-4.5',
     streaming: true,
     onPermissionRequest: approveAll,
     systemMessage: {
@@ -992,6 +1019,7 @@ async function streamAgentReply(session, prompt, sendEvent, mode = 'agent', sign
   let sawAssistantText = false;
   let lastAssistantMessage = '';
   let sessionError = null;
+  let interruptRun = null;
   let watchdogId = null;
   let activeStep = null;
   let onAbort = null;
@@ -1018,6 +1046,10 @@ async function streamAgentReply(session, prompt, sendEvent, mode = 'agent', sign
     if (sessionError) return;
     sessionError = new Error(reason);
     sessionError.metadata = metadata;
+    if (interruptRun) {
+      interruptRun(sessionError);
+      interruptRun = null;
+    }
     try {
       Promise.resolve(session.disconnect()).catch(() => {});
     } catch (_) {}
@@ -1132,17 +1164,30 @@ async function streamAgentReply(session, prompt, sendEvent, mode = 'agent', sign
 
     let finalEvent;
     try {
-      finalEvent = await session.sendAndWait({ prompt }, REQUEST_TIMEOUT_MS);
+      const interruptPromise = new Promise((_, reject) => {
+        interruptRun = reject;
+      });
+      finalEvent = await Promise.race([
+        session.sendAndWait({ prompt }, REQUEST_TIMEOUT_MS),
+        interruptPromise,
+      ]);
+      interruptRun = null;
     } catch (err) {
+      interruptRun = null;
       if (sessionError) throw sessionError;
 
       const errMsg = err?.message || 'Unknown session error';
       if (/session\.idle|timeout|timed.?out/i.test(errMsg)) {
+        const activeStepElapsedMs = activeStep ? Date.now() - activeStep.startedAt : null;
         const activeStepHint = activeStep ? ` Last active step: ${activeStep.tool}.` : '';
         const timeoutErr = new Error(`Timeout after ${formatDurationMs(REQUEST_TIMEOUT_MS)} waiting for session.idle.${activeStepHint}`);
         timeoutErr.metadata = {
           isTimeout: true,
           activeStep: activeStep ? activeStep.tool : null,
+          activeStepElapsedMs,
+          sawAssistantText,
+          consecutiveStepCount,
+          repeatedStepSignatures: stepExecutionCounts.size,
         };
         throw timeoutErr;
       }
@@ -1354,6 +1399,7 @@ app.post('/api/chat', async (req, res) => {
   const requestAbortController = new AbortController();
   const { signal: requestSignal } = requestAbortController;
   let clientDisconnected = false;
+  let resetSessionAfterAbort = false;
 
   console.log(
     `[chat] request.start id=${requestId} provider=${provider} mode=${mode} chars=${fullMessage.length} attachments=${attachmentCount}`,
@@ -1396,6 +1442,7 @@ app.post('/api/chat', async (req, res) => {
   const onClientClose = () => {
     if (res.writableEnded || clientDisconnected) return;
     clientDisconnected = true;
+    resetSessionAfterAbort = provider === 'copilot' && mode !== 'plan';
     requestAbortController.abort();
     console.warn(`[chat] request.cancelled id=${requestId} reason=client_disconnected`);
   };
@@ -1485,12 +1532,29 @@ app.post('/api/chat', async (req, res) => {
     sendEvent({ type: 'done' });
   } catch (err) {
     if (isAbortError(err) || requestSignal.aborted) {
+      if (resetSessionAfterAbort) {
+        try {
+          console.warn(`[chat] request.cleanup id=${requestId} action=session_reset_after_disconnect`);
+          await createAgentSession();
+          console.warn(`[chat] request.cleanup.complete id=${requestId} sessionId=${agentSession.sessionId}`);
+        } catch (resetErr) {
+          console.error(`[chat] request.cleanup.failed id=${requestId} reason=${resetErr?.message || resetErr}`);
+        }
+      }
       console.warn(`[chat] request.aborted id=${requestId} provider=${provider} mode=${mode} duration=${formatDurationMs(Date.now() - startedAt)}`);
       return;
     }
 
     console.error('[copilot] chat error:', err);
     const message = err?.message || 'Unknown chat error';
+    const metadata = err?.metadata || {};
+
+    if (isTimeoutError(err)) {
+      console.error(
+        `[chat] timeout.detail id=${requestId} provider=${provider} mode=${mode} activeStep=${metadata.activeStep || 'none'} activeStepElapsedMs=${metadata.activeStepElapsedMs || 0} sawAssistantText=${Boolean(metadata.sawAssistantText)} repeatedSignatures=${metadata.repeatedStepSignatures || 0} consecutiveStepCount=${metadata.consecutiveStepCount || 0}`,
+      );
+    }
+
     if (/authentication info|custom provider|401|unauthorized|api key/i.test(message)) {
       sendEvent({
         type: 'error',
@@ -1498,11 +1562,10 @@ app.post('/api/chat', async (req, res) => {
           ? 'Copilot auth is missing for the current mode. Use Provider Sign-in in Settings (logged-in user or token).'
           : provider === 'local'
             ? 'Local provider rejected auth. Verify Local base URL/API key in Settings > Provider Sign-in.'
-            : 'Codex CLI is not authenticated. Run `codex` in the terminal and log in with your ChatGPT account.',
+            : 'Codex CLI is not authenticated. Run `codex` in the terminal and log in with your OpenAI account.',
       });
     } else {
       const isTimeout = /timeout|timed.?out/i.test(message);
-      const metadata = err?.metadata || {};
       sendEvent({
         type: 'error',
         message: isTimeout ? `Request timed out after ${formatDurationMs(REQUEST_TIMEOUT_MS)}.` : message,
@@ -1695,6 +1758,7 @@ function providerStatusPayload() {
       authMode: activeCopilotAuthMode,
       tokenConfigured: Boolean(copilotToken),
       tokenPreview: redactSecret(copilotToken),
+      model: String(runtimeProviderConfig.copilot.model || 'claude-sonnet-4.5').trim(),
       error: copilotInitError,
     },
     codex: {
@@ -1792,6 +1856,84 @@ app.post('/api/providers/codex/login', (req, res) => {
   });
 });
 
+// POST /api/providers/copilot/login — run gh auth login device flow and stream
+// plain text output via SSE so mobile users can complete login externally.
+app.post('/api/providers/copilot/login', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const sendSSE = (data) => {
+    if (!res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  const cleanCliText = (value) => String(value || '')
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001b\][^\u0007]*(\u0007|\u001b\\)/g, '')
+    .replace(/\u001b[@-Z\\-_]/g, '');
+
+  if (!checkGhCliInstalled()) {
+    sendSSE({ type: 'error', message: 'GitHub CLI (gh) is not installed. Run: brew install gh  or see https://cli.github.com' });
+    res.end();
+    return;
+  }
+
+  let proc;
+  try {
+    proc = spawn('gh', ['auth', 'login', '--git-protocol', 'https', '--hostname', 'github.com', '--web'], {
+      cwd: process.env.HOME || WORKSPACE,
+      env: { ...process.env, NO_COLOR: '1', TERM: 'dumb', CI: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    sendSSE({ type: 'error', message: `Failed to start GitHub CLI: ${err.message}` });
+    res.end();
+    return;
+  }
+
+  let sawOutput = false;
+
+  const onData = (chunk) => {
+    const text = cleanCliText(chunk);
+    if (!text) return;
+    sawOutput = true;
+    sendSSE({ type: 'output', content: text });
+  };
+
+  proc.stdout.on('data', onData);
+  proc.stderr.on('data', onData);
+
+  proc.on('error', (err) => {
+    sendSSE({ type: 'error', message: `GitHub CLI login failed: ${err.message}` });
+    if (!res.writableEnded) res.end();
+  });
+
+  proc.on('close', async (exitCode) => {
+    _ghCliInstalledAt = 0;
+    if (!sawOutput) {
+      sendSSE({ type: 'error', message: 'gh auth login exited without output. Try running `gh auth login` in the terminal.' });
+    }
+    if (exitCode === 0) {
+      // Reinit the Copilot SDK so it picks up the newly stored credentials.
+      runtimeProviderConfig.copilot.authType = 'logged-in-user';
+      try {
+        await initCopilotAgent();
+        sendSSE({ type: 'done', exitCode, reinitialized: true });
+      } catch (err) {
+        sendSSE({ type: 'done', exitCode, reinitialized: false, reinitError: err.message });
+      }
+    } else {
+      sendSSE({ type: 'done', exitCode });
+    }
+    if (!res.writableEnded) res.end();
+  });
+
+  req.on('close', () => {
+    try { proc.kill('SIGTERM'); } catch (_) {}
+  });
+});
+
 app.post('/api/providers/local/health', async (req, res) => {
   const baseUrl = String(req.body?.baseUrl || runtimeProviderConfig.local.baseUrl || '').trim();
   const model = String(req.body?.model || runtimeProviderConfig.local.model || '').trim();
@@ -1869,6 +2011,13 @@ app.post('/api/providers/config', async (req, res) => {
       if (typeof nextCopilot.token === 'string') {
         runtimeProviderConfig.copilot.token = sealSecret(nextCopilot.token);
         shouldReinitCopilot = true;
+      }
+
+      if (typeof nextCopilot.model === 'string') {
+        const model = String(nextCopilot.model).trim();
+        if (['claude-sonnet-4.5', 'claude-sonnet-4', 'gpt-5'].includes(model)) {
+          runtimeProviderConfig.copilot.model = model;
+        }
       }
     }
 
@@ -2309,7 +2458,7 @@ async function getPatchForFile(file, repoCwd) {
   const snapshotContent = keepSnapshots.get(wsKey);
 
   if (snapshotContent !== undefined) {
-    const tmpFile = path.join(os.tmpdir(), `pocketide-snap-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const tmpFile = path.join(os.tmpdir(), `pocketcode-snap-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     try {
       fs.writeFileSync(tmpFile, snapshotContent, 'utf8');
       return await runGitWithAllowedCodes(
@@ -2805,7 +2954,7 @@ app.post('/api/git/checkout', async (req, res) => {
     }
 
     if (strategy === 'stash') {
-      const stashMessage = `pocketide:auto-stash:${new Date().toISOString()}`;
+      const stashMessage = `pocketcode:auto-stash:${new Date().toISOString()}`;
       const stashOutput = await runGit(['stash', 'push', '-u', '-m', stashMessage], repoCwd);
       const checkoutArgs = await resolveCheckoutArgs(branch, remote, false, repoCwd);
       const output = await runGit(checkoutArgs, repoCwd);
@@ -2961,6 +3110,18 @@ const io = new Server(server, {
 // =============================================================================
 
 const shells = new Map();
+const CLIENT_CODE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+
+function toClientCode(seed) {
+  const hash = crypto.createHash('sha256').update(String(seed || '')).digest();
+  let code = '';
+
+  for (let i = 0; i < 5; i += 1) {
+    code += CLIENT_CODE_ALPHABET[hash[i] % CLIENT_CODE_ALPHABET.length];
+  }
+
+  return code;
+}
 
 function resolveShellPath() {
   const candidates = [process.env.SHELL, '/bin/zsh', '/bin/bash', '/bin/sh'];
@@ -2982,7 +3143,8 @@ function resolveShellArgs(shellPath) {
 }
 
 io.on('connection', (socket) => {
-  console.log(`[terminal] client connected: ${socket.id}`);
+  const clientCode = toClientCode(socket.id);
+  console.log(`[terminal] client connected: ${clientCode}`);
 
   const shellPath = resolveShellPath();
   const shellArgs = resolveShellArgs(shellPath);
@@ -2997,7 +3159,7 @@ io.on('connection', (socket) => {
     });
     isPty = true;
   } catch (err) {
-    console.error(`[terminal] failed to spawn shell for ${socket.id}:`, err.message);
+    console.error(`[terminal] failed to spawn shell for ${clientCode}:`, err.message);
 
     // Fallback for environments where node-pty cannot spawn (e.g. ABI/runtime issues).
     shell = spawn(shellPath, shellArgs, {
@@ -3007,7 +3169,7 @@ io.on('connection', (socket) => {
     });
 
     shell.on('error', (fallbackErr) => {
-      console.error(`[terminal] fallback shell failed for ${socket.id}:`, fallbackErr.message);
+      console.error(`[terminal] fallback shell failed for ${clientCode}:`, fallbackErr.message);
       socket.emit('output', `Terminal unavailable: ${fallbackErr.message}\n`);
     });
 
@@ -3044,13 +3206,13 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
-    console.log(`[terminal] client disconnected: ${socket.id}`);
+    console.log(`[terminal] client disconnected: ${clientCode}`);
     try { shell.kill(); } catch (_) {}
     shells.delete(socket.id);
   });
 
   socket.on('error', (err) => {
-    console.error(`[terminal] socket error ${socket.id}:`, err);
+    console.error(`[terminal] socket error ${clientCode}:`, err);
   });
 });
 
@@ -3058,8 +3220,18 @@ io.on('connection', (socket) => {
 // Graceful shutdown
 // =============================================================================
 
-async function shutdown() {
-  console.log('[server] shutting down...');
+async function shutdown(source = 'unknown') {
+  if (isShuttingDown) {
+    console.log(`[server] shutdown already in progress (source=${source})`);
+    return;
+  }
+  isShuttingDown = true;
+
+  const ctx = buildRuntimeContext();
+  console.log(
+    `[server] shutting down... source=${source} pid=${ctx.pid} ppid=${ctx.ppid} uptime=${ctx.uptimeSec}s activeShells=${ctx.activeShells}`,
+  );
+
   shells.forEach((shell) => { try { shell.kill(); } catch (_) {} });
 
   if (agentSession) {
@@ -3075,8 +3247,8 @@ async function shutdown() {
   });
 }
 
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 process.on('uncaughtException', (err) => {
   console.error('[fatal] uncaughtException:', err?.stack || err?.message || err);
@@ -3092,7 +3264,7 @@ server.on('error', (err) => {
 
   if (err.code === 'EADDRINUSE') {
     console.error(`[server] Failed to bind ${HOST}:${PORT} - port already in use.`);
-    console.error('[server] Another PocketIDE-Server process may still be running.');
+    console.error('[server] Another PocketCode-Server process may still be running.');
   } else if (err.code === 'EACCES') {
     console.error(`[server] Failed to bind ${HOST}:${PORT} - permission denied.`);
   } else {
@@ -3109,7 +3281,8 @@ server.headersTimeout = REQUEST_TIMEOUT_MS + 1000;
 server.requestTimeout = REQUEST_TIMEOUT_MS + 1000;
 
 server.listen(PORT, HOST, async () => {
-  console.log(`[server] PocketIDE Server listening on ${HOST}:${PORT}`);
+  console.log(`[server] PocketCode Server listening on ${HOST}:${PORT}`);
   console.log(`[server] workspace: ${WORKSPACE}`);
+  console.log(`[server] pid=${process.pid} ppid=${process.ppid} timeout=${formatDurationMs(REQUEST_TIMEOUT_MS)} toolStepTimeout=${formatDurationMs(TOOL_STEP_TIMEOUT_MS)}`);
   await initCopilotAgent();
 });

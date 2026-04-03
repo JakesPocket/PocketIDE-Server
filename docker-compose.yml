@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: pocketide-server
+    container_name: pocketcode-server
     ports:
       - "3000:3000"
     volumes:
