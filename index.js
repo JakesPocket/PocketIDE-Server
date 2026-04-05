@@ -261,7 +261,8 @@ function serializeCloudJobsForStore() {
       id: job.id,
       status: job.status,
       provider: normalizeProvider(job.provider || 'copilot'),
-      aiMode: job.aiMode,
+      aiMode: normalizeAiMode(job.aiMode),
+      executionMode: 'cloud',
       message: job.message,
       turnId: job.turnId,
       resultText: job.resultText || '',
@@ -334,7 +335,7 @@ function loadCloudJobsFromDisk() {
         id,
         status,
         provider: normalizeProvider(stored.provider || 'copilot'),
-        aiMode: ['agent', 'ask', 'plan', 'cloud'].includes(stored.aiMode) ? stored.aiMode : 'cloud',
+        aiMode: normalizeAiMode(stored.aiMode),
         message: typeof stored.message === 'string' ? stored.message : '',
         turnId: typeof stored.turnId === 'string' ? stored.turnId : null,
         createdAt: typeof stored.createdAt === 'string' ? stored.createdAt : nowIso(),
@@ -371,6 +372,12 @@ function normalizeProvider(value) {
   const provider = String(value || 'copilot').toLowerCase().trim();
   if (provider === 'codex' || provider === 'local') return provider;
   return 'copilot';
+}
+
+function normalizeAiMode(value) {
+  const mode = String(value || 'agent').toLowerCase().trim();
+  if (mode === 'ask' || mode === 'plan') return mode;
+  return 'agent';
 }
 
 // Codex CLI helpers — cached to avoid repeated subprocess spawns per request
@@ -468,7 +475,8 @@ function serializeCloudJob(job, includeEvents = false) {
     jobId: job.id,
     provider: normalizeProvider(job.provider || 'copilot'),
     status: job.status,
-    aiMode: job.aiMode,
+    aiMode: normalizeAiMode(job.aiMode),
+    executionMode: 'cloud',
     message: job.message,
     turnId: job.turnId,
     resultText: job.resultText || null,
@@ -518,10 +526,21 @@ function formatAttachmentSize(bytes) {
   return ` ${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
-function buildAttachmentContext(attachments) {
+function toWorkspaceDisplayPath(targetPath) {
+  const abs = path.resolve(String(targetPath || ''));
+  const root = path.resolve(WORKSPACE);
+  if (abs === root) return '.';
+  if (abs.startsWith(`${root}${path.sep}`)) {
+    return path.relative(root, abs).replace(/\\/g, '/');
+  }
+  return abs;
+}
+
+function buildAttachmentContext(attachments, stagedImagePaths = []) {
   if (!Array.isArray(attachments) || attachments.length === 0) return '';
 
   const parts = [];
+  let imagePathIndex = 0;
   for (const att of attachments) {
     if (!att || typeof att !== 'object') continue;
     const name = typeof att.name === 'string' && att.name ? att.name : 'unnamed';
@@ -529,7 +548,13 @@ function buildAttachmentContext(attachments) {
     const sizeHint = formatAttachmentSize(att.size);
 
     if (att.isImage) {
-      parts.push(`[Attached image: ${name}${sizeHint}]`);
+      const stagedPath = stagedImagePaths[imagePathIndex] || '';
+      imagePathIndex += 1;
+      if (stagedPath) {
+        parts.push(`[Attached image: ${name}${sizeHint} — agent-accessible temp file: ${toWorkspaceDisplayPath(stagedPath)}]`);
+      } else {
+        parts.push(`[Attached image: ${name}${sizeHint}]`);
+      }
     } else if (att.isText && data) {
       parts.push(`--- Attached file: ${name} ---\n${data}\n--- End of ${name} ---`);
     } else if (data) {
@@ -580,7 +605,7 @@ function toSafeFilename(name, fallback = 'image') {
   return safe || fallback;
 }
 
-function prepareCodexImageInputs(attachments, requestId) {
+function prepareImageAttachmentInputs(attachments, requestId) {
   if (!Array.isArray(attachments) || attachments.length === 0) {
     return { imagePaths: [], cleanup: () => {} };
   }
@@ -649,7 +674,7 @@ async function runSingleCloudJob(job) {
   }
 
   let cloudSession = null;
-  const effectiveMode = job.aiMode === 'cloud' ? 'agent' : job.aiMode;
+  const effectiveMode = normalizeAiMode(job.aiMode);
   const enhancedPrompt = buildEnhancedPromptForMode(job.message, effectiveMode);
   const eventAccumulator = {
     finalMessage: '',
@@ -1390,9 +1415,10 @@ setInterval(cleanupCloudJobs, 10 * 60 * 1000);
 app.post('/api/chat', async (req, res) => {
   const { message, aiMode, attachments } = req.body;
   const provider = normalizeProvider(req.body?.provider || 'copilot');
-  const attachmentContext = buildAttachmentContext(attachments);
-  const fullMessage = (message || '') + attachmentContext;
   const requestId = createChatRequestId();
+  const stagedImageInputs = prepareImageAttachmentInputs(attachments, requestId);
+  const attachmentContext = buildAttachmentContext(attachments, stagedImageInputs.imagePaths);
+  const fullMessage = (message || '') + attachmentContext;
   const startedAt = Date.now();
   const attachmentCount = Array.isArray(attachments) ? attachments.length : 0;
   const mode = String(aiMode || 'agent').toLowerCase().trim();
@@ -1407,16 +1433,19 @@ app.post('/api/chat', async (req, res) => {
 
   if (!fullMessage.trim()) {
     console.warn(`[chat] request.reject id=${requestId} reason=empty_message`);
+    stagedImageInputs.cleanup();
     return res.status(400).json({ error: 'Message is required' });
   }
 
   if (provider === 'copilot' && !agentSession) {
     console.warn(`[chat] request.reject id=${requestId} provider=copilot reason=session_unavailable`);
+    stagedImageInputs.cleanup();
     return res.status(503).json({ error: 'Copilot agent not initialised. Check Copilot auth/login for the selected auth mode.' });
   }
 
   if (provider === 'copilot' && agentBusy) {
     console.warn(`[chat] request.reject id=${requestId} provider=copilot reason=agent_busy`);
+    stagedImageInputs.cleanup();
     return res.status(429).json({ error: 'Agent is busy processing a previous request.' });
   }
 
@@ -1462,18 +1491,13 @@ app.post('/api/chat', async (req, res) => {
       if (provider === 'codex') {
         quietStage = 'provider';
         emitProgress('provider', 'Launching Codex CLI...');
-        const codexInputs = prepareCodexImageInputs(attachments, requestId);
-        try {
-          await streamCodexReply(
-            enhancedPrompt,
-            sendEvent,
-            mode,
-            requestSignal,
-            { imagePaths: codexInputs.imagePaths },
-          );
-        } finally {
-          codexInputs.cleanup();
-        }
+        await streamCodexReply(
+          enhancedPrompt,
+          sendEvent,
+          mode,
+          requestSignal,
+          { imagePaths: stagedImageInputs.imagePaths },
+        );
       } else if (provider === 'local') {
         quietStage = 'provider';
         emitProgress('provider', 'Waiting for local provider...');
@@ -1579,6 +1603,7 @@ app.post('/api/chat', async (req, res) => {
     clearInterval(heartbeat);
     res.off('close', onClientClose);
     if (provider === 'copilot') agentBusy = false;
+    stagedImageInputs.cleanup();
     if (!res.writableEnded) res.end();
   }
 });
@@ -1590,20 +1615,18 @@ app.post('/api/chat', async (req, res) => {
 app.post('/api/jobs', (req, res) => {
   const rawMessage = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
   const attachments = req.body?.attachments;
-  const attachmentContext = buildAttachmentContext(attachments);
+  const jobId = createCloudJobId();
+  const stagedImageInputs = prepareImageAttachmentInputs(attachments, jobId);
+  const attachmentContext = buildAttachmentContext(attachments, stagedImageInputs.imagePaths);
   const message = rawMessage + attachmentContext;
   if (!message.trim()) {
+    stagedImageInputs.cleanup();
     return res.status(400).json({ error: 'message is required' });
   }
 
-  const rawMode = String(req.body?.aiMode || 'cloud').toLowerCase().trim();
-  const aiMode = ['agent', 'ask', 'plan', 'cloud'].includes(rawMode) ? rawMode : 'cloud';
+  const aiMode = normalizeAiMode(req.body?.aiMode);
   const provider = normalizeProvider(req.body?.provider || 'copilot');
   const turnId = typeof req.body?.turnId === 'string' && req.body.turnId.trim() ? req.body.turnId.trim() : null;
-  const jobId = createCloudJobId();
-  const codexInputs = provider === 'codex'
-    ? prepareCodexImageInputs(attachments, jobId)
-    : { imagePaths: [], cleanup: () => {} };
 
   const job = {
     id: jobId,
@@ -1621,18 +1644,15 @@ app.post('/api/jobs', (req, res) => {
     cancelRequested: false,
     nextEventId: 0,
     events: [],
-    imagePaths: codexInputs.imagePaths,
+    imagePaths: stagedImageInputs.imagePaths,
     _attachmentsCleaned: false,
   };
-
-  if (provider !== 'codex') {
-    codexInputs.cleanup();
-  }
 
   cloudJobs.set(job.id, job);
   pushCloudJobEvent(job, 'job.created', {
     status: job.status,
     aiMode: job.aiMode,
+    executionMode: 'cloud',
     turnId: job.turnId,
   });
   enqueueCloudJob(job.id);
@@ -1640,6 +1660,8 @@ app.post('/api/jobs', (req, res) => {
   res.status(202).json({
     jobId: job.id,
     provider: job.provider,
+    aiMode: job.aiMode,
+    executionMode: 'cloud',
     status: job.status,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
