@@ -1,0 +1,14 @@
+{
+  "turnCode": "3ONQHQ",
+  "type": "follow-up",
+  "provider": "copilot",
+  "aiMode": "agent",
+  "message": "[Follow-up on task 2295QZ]\n\nWhat about src/components",
+  "status": "succeeded",
+  "jobId": "3ONQHQ",
+  "parentTurnCode": "2295QZ",
+  "createdAt": "2026-04-08T03:28:04.274Z",
+  "updatedAt": "2026-04-08T03:28:14.282Z",
+  "finishedAt": "2026-04-08T03:28:14.282Z",
+  "error": null
+}

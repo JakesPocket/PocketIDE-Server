@@ -253,6 +253,67 @@ const CLOUD_JOBS_STORE_PATH = process.env.CLOUD_JOBS_STORE_PATH
   : path.resolve(__dirname, 'data', 'cloud-jobs.json');
 let cloudJobsPersistTimer = null;
 
+// ---------------------------------------------------------------------------
+// Turn store — one JSON file per turn in data/turns/<code>.json
+// ---------------------------------------------------------------------------
+const TURNS_DIR = path.resolve(__dirname, 'data', 'turns');
+const turnsCache = new Map();
+
+function loadTurnsFromDisk() {
+  if (!fs.existsSync(TURNS_DIR)) return;
+  for (const file of fs.readdirSync(TURNS_DIR)) {
+    if (!file.endsWith('.json')) continue;
+    try {
+      const raw = fs.readFileSync(path.join(TURNS_DIR, file), 'utf8');
+      const turn = JSON.parse(raw);
+      if (turn && turn.turnCode) turnsCache.set(turn.turnCode, turn);
+    } catch { /* skip corrupt files */ }
+  }
+  console.log(`[turns] loaded ${turnsCache.size} turns from disk`);
+}
+
+function persistTurn(turn) {
+  try {
+    fs.mkdirSync(TURNS_DIR, { recursive: true });
+    const filePath = path.join(TURNS_DIR, `${turn.turnCode}.json`);
+    const tmp = `${filePath}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(turn, null, 2), 'utf8');
+    fs.renameSync(tmp, filePath);
+  } catch (err) {
+    console.error(`[turns] persist failed for ${turn.turnCode}:`, err.message);
+  }
+}
+
+function recordTurn({ turnCode, type, provider, aiMode, message, status, jobId, parentTurnCode, error }) {
+  const existing = turnsCache.get(turnCode);
+  const turn = existing || {
+    turnCode,
+    type,
+    provider: provider || 'copilot',
+    aiMode: aiMode || 'agent',
+    message: message || '',
+    status: status || 'started',
+    jobId: jobId || null,
+    parentTurnCode: parentTurnCode || null,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    finishedAt: null,
+    error: null,
+  };
+  if (existing) {
+    if (status) turn.status = status;
+    if (error) turn.error = error;
+    if (jobId) turn.jobId = jobId;
+    turn.updatedAt = nowIso();
+    if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
+      turn.finishedAt = nowIso();
+    }
+  }
+  turnsCache.set(turnCode, turn);
+  persistTurn(turn);
+  return turn;
+}
+
 function serializeCloudJobsForStore() {
   return {
     version: 1,
@@ -435,7 +496,13 @@ function redactSecret(secret) {
 }
 
 function createCloudJobId() {
-  return `job_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  // Generate a 6-character uppercase alphanumeric code (0-9, A-Z)
+  const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
 }
 
 function nowIso() {
@@ -468,6 +535,11 @@ function setCloudJobStatus(job, status, extras = {}) {
   }
   job.updatedAt = nowIso();
   pushCloudJobEvent(job, 'job.status', { status });
+
+  // Update corresponding turn record
+  if (turnsCache.has(job.id)) {
+    recordTurn({ turnCode: job.id, status, error: job.error ? job.error.message || String(job.error) : undefined });
+  }
 }
 
 function serializeCloudJob(job, includeEvents = false) {
@@ -517,6 +589,7 @@ function enqueueCloudJob(jobId) {
 }
 
 loadCloudJobsFromDisk();
+loadTurnsFromDisk();
 process.on('exit', flushCloudJobsPersistence);
 
 function formatAttachmentSize(bytes) {
@@ -678,6 +751,7 @@ async function runSingleCloudJob(job) {
   const enhancedPrompt = buildEnhancedPromptForMode(job.message, effectiveMode);
   const eventAccumulator = {
     finalMessage: '',
+    deltaBuffer: '',
     sawMessage: false,
     sawError: false,
   };
@@ -692,6 +766,10 @@ async function runSingleCloudJob(job) {
     if (event.type === 'message' && typeof event.content === 'string') {
       eventAccumulator.sawMessage = true;
       eventAccumulator.finalMessage = event.content;
+    }
+
+    if (event.type === 'delta' && typeof event.content === 'string') {
+      eventAccumulator.deltaBuffer += event.content;
     }
 
     if (event.type === 'error') {
@@ -757,7 +835,7 @@ async function runSingleCloudJob(job) {
   }
 
   if (!eventAccumulator.sawMessage) {
-    return '';
+    return eventAccumulator.deltaBuffer || '';
   }
   return eventAccumulator.finalMessage;
 }
@@ -1119,7 +1197,12 @@ async function streamAgentReply(session, prompt, sendEvent, mode = 'agent', sign
         if (content) {
           sawAssistantText = true;
           lastAssistantMessage = content;
-          sendEvent({ type: 'message', content });
+          // Only send the final message event if we didn't already stream deltas
+          // (deltas are sent via 'assistant.message_delta' events; the complete
+          // message event is redundant if deltas were already streamed to the client)
+          if (!announcedWriting) {
+            sendEvent({ type: 'message', content });
+          }
         }
         return;
       }
@@ -1392,7 +1475,7 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
 setInterval(cleanupCloudJobs, 10 * 60 * 1000);
 
@@ -1415,6 +1498,7 @@ setInterval(cleanupCloudJobs, 10 * 60 * 1000);
 app.post('/api/chat', async (req, res) => {
   const { message, aiMode, attachments } = req.body;
   const provider = normalizeProvider(req.body?.provider || 'copilot');
+  const turnCode = typeof req.body?.turnCode === 'string' ? req.body.turnCode.trim().toUpperCase() : null;
   const requestId = createChatRequestId();
   const stagedImageInputs = prepareImageAttachmentInputs(attachments, requestId);
   const attachmentContext = buildAttachmentContext(attachments, stagedImageInputs.imagePaths);
@@ -1428,7 +1512,7 @@ app.post('/api/chat', async (req, res) => {
   let resetSessionAfterAbort = false;
 
   console.log(
-    `[chat] request.start id=${requestId} provider=${provider} mode=${mode} chars=${fullMessage.length} attachments=${attachmentCount}`,
+    `[chat] request.start id=${requestId} provider=${provider} mode=${mode} chars=${fullMessage.length} attachments=${attachmentCount}${turnCode ? ` turnCode=${turnCode}` : ''}`,
   );
 
   if (!fullMessage.trim()) {
@@ -1457,6 +1541,18 @@ app.post('/api/chat', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
+
+  // Record chat turn
+  if (turnCode) {
+    recordTurn({
+      turnCode,
+      type: 'chat',
+      provider,
+      aiMode: mode,
+      message: message || '',
+      status: 'streaming',
+    });
+  }
 
   const sendEvent = (payload) => {
     if (!res.writableEnded && !clientDisconnected) {
@@ -1554,6 +1650,7 @@ app.post('/api/chat', async (req, res) => {
     console.log(`[chat] request.success id=${requestId} provider=${provider} mode=${mode} duration=${formatDurationMs(Date.now() - startedAt)}`);
     emitProgress('done', 'Completed.');
     sendEvent({ type: 'done' });
+    if (turnCode) recordTurn({ turnCode, status: 'succeeded' });
   } catch (err) {
     if (isAbortError(err) || requestSignal.aborted) {
       if (resetSessionAfterAbort) {
@@ -1566,6 +1663,7 @@ app.post('/api/chat', async (req, res) => {
         }
       }
       console.warn(`[chat] request.aborted id=${requestId} provider=${provider} mode=${mode} duration=${formatDurationMs(Date.now() - startedAt)}`);
+      if (turnCode) recordTurn({ turnCode, status: 'cancelled' });
       return;
     }
 
@@ -1599,6 +1697,7 @@ app.post('/api/chat', async (req, res) => {
       });
     }
     console.error(`[chat] request.failed id=${requestId} provider=${provider} mode=${mode} duration=${formatDurationMs(Date.now() - startedAt)} reason=${message}`);
+    if (turnCode) recordTurn({ turnCode, status: 'failed', error: message });
   } finally {
     clearInterval(heartbeat);
     res.off('close', onClientClose);
@@ -1609,13 +1708,36 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
+// Turns API — look up any turn by its 6-char code
+// -----------------------------------------------------------------------------
+
+app.get('/api/turns', (req, res) => {
+  const limitRaw = Number.parseInt(String(req.query?.limit || '50'), 10);
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 50;
+  const turns = [...turnsCache.values()]
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+    .slice(0, limit);
+  res.json({ turns });
+});
+
+app.get('/api/turns/:code', (req, res) => {
+  const turn = turnsCache.get(req.params.code.toUpperCase());
+  if (!turn) return res.status(404).json({ error: 'Turn not found' });
+  res.json({ turn });
+});
+
+// -----------------------------------------------------------------------------
 // Cloud jobs API (background execution queue)
 // -----------------------------------------------------------------------------
 
 app.post('/api/jobs', (req, res) => {
   const rawMessage = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
   const attachments = req.body?.attachments;
-  const jobId = createCloudJobId();
+
+  // Accept client-provided jobId (turnCode) with validation and collision check
+  const clientJobId = typeof req.body?.clientJobId === 'string' ? req.body.clientJobId.trim().toUpperCase() : '';
+  const validClientId = /^[A-Z0-9]{6}$/.test(clientJobId) && !cloudJobs.has(clientJobId);
+  const jobId = validClientId ? clientJobId : createCloudJobId();
   const stagedImageInputs = prepareImageAttachmentInputs(attachments, jobId);
   const attachmentContext = buildAttachmentContext(attachments, stagedImageInputs.imagePaths);
   const message = rawMessage + attachmentContext;
@@ -1657,6 +1779,19 @@ app.post('/api/jobs', (req, res) => {
   });
   enqueueCloudJob(job.id);
 
+  // Record this turn
+  const isFollowUp = /^\[Follow-up on task /.test(rawMessage);
+  recordTurn({
+    turnCode: jobId,
+    type: isFollowUp ? 'follow-up' : 'task',
+    provider,
+    aiMode,
+    message: rawMessage,
+    status: 'queued',
+    jobId,
+    parentTurnCode: isFollowUp ? turnId : null,
+  });
+
   res.status(202).json({
     jobId: job.id,
     provider: job.provider,
@@ -1681,7 +1816,7 @@ app.get('/api/jobs', (req, res) => {
 });
 
 app.get('/api/jobs/:jobId', (req, res) => {
-  const job = cloudJobs.get(req.params.jobId);
+  const job = cloudJobs.get(req.params.jobId.toUpperCase());
   if (!job) {
     return res.status(404).json({ error: 'Job not found' });
   }
@@ -1690,7 +1825,7 @@ app.get('/api/jobs/:jobId', (req, res) => {
 });
 
 app.get('/api/jobs/:jobId/events', (req, res) => {
-  const job = cloudJobs.get(req.params.jobId);
+  const job = cloudJobs.get(req.params.jobId.toUpperCase());
   if (!job) {
     return res.status(404).json({ error: 'Job not found' });
   }
@@ -1704,7 +1839,7 @@ app.get('/api/jobs/:jobId/events', (req, res) => {
 });
 
 app.post('/api/jobs/:jobId/cancel', (req, res) => {
-  const job = cloudJobs.get(req.params.jobId);
+  const job = cloudJobs.get(req.params.jobId.toUpperCase());
   if (!job) {
     return res.status(404).json({ error: 'Job not found' });
   }
@@ -3107,6 +3242,89 @@ app.get('/api/health', (req, res) => {
     status: 'ok',
     agent: agentSession ? 'ready' : 'unavailable',
     sessionId: agentSession?.sessionId ?? null,
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Restart endpoints (dev tooling)
+// -----------------------------------------------------------------------------
+
+const FRONTEND_DIR = path.resolve(__dirname, '..', 'PocketCode');
+
+app.post('/api/restart/server', (req, res) => {
+  console.log('[restart] Server restart requested');
+  flushCloudJobsPersistence();
+  res.json({ ok: true, message: 'Server restarting...' });
+  setTimeout(() => {
+    const child = spawn(process.argv[0], [__filename], {
+      cwd: __dirname,
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env },
+    });
+    child.unref();
+    process.exit(0);
+  }, 300);
+});
+
+app.post('/api/restart/frontend', (req, res) => {
+  console.log('[restart] Frontend rebuild requested');
+  const proc = spawn('npx', ['vite', 'build', '--mode', 'development'], {
+    cwd: FRONTEND_DIR,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env },
+  });
+  let output = '';
+  proc.stdout.on('data', (d) => { output += d.toString(); });
+  proc.stderr.on('data', (d) => { output += d.toString(); });
+  proc.on('close', (code) => {
+    if (code === 0) {
+      console.log('[restart] Frontend rebuild succeeded');
+      res.json({ ok: true, message: 'Frontend rebuilt successfully.' });
+    } else {
+      console.error('[restart] Frontend rebuild failed:', output);
+      res.status(500).json({ ok: false, message: `Build failed (exit ${code})`, output });
+    }
+  });
+  proc.on('error', (err) => {
+    console.error('[restart] Frontend rebuild error:', err.message);
+    res.status(500).json({ ok: false, message: err.message });
+  });
+});
+
+app.post('/api/restart/both', (req, res) => {
+  console.log('[restart] Full restart (frontend rebuild + server restart) requested');
+  flushCloudJobsPersistence();
+  const proc = spawn('npx', ['vite', 'build', '--mode', 'development'], {
+    cwd: FRONTEND_DIR,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env },
+  });
+  let output = '';
+  proc.stdout.on('data', (d) => { output += d.toString(); });
+  proc.stderr.on('data', (d) => { output += d.toString(); });
+  proc.on('close', (code) => {
+    if (code !== 0) {
+      console.error('[restart] Frontend rebuild failed, aborting server restart:', output);
+      res.status(500).json({ ok: false, message: `Build failed (exit ${code}), server NOT restarted.`, output });
+      return;
+    }
+    console.log('[restart] Frontend rebuilt, now restarting server...');
+    res.json({ ok: true, message: 'Frontend rebuilt, server restarting...' });
+    setTimeout(() => {
+      const child = spawn(process.argv[0], [__filename], {
+        cwd: __dirname,
+        detached: true,
+        stdio: 'ignore',
+        env: { ...process.env },
+      });
+      child.unref();
+      process.exit(0);
+    }, 300);
+  });
+  proc.on('error', (err) => {
+    console.error('[restart] Frontend rebuild error:', err.message);
+    res.status(500).json({ ok: false, message: err.message });
   });
 });
 

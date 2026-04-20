@@ -1,0 +1,14 @@
+{
+  "turnCode": "03O5KT",
+  "type": "chat",
+  "provider": "copilot",
+  "aiMode": "agent",
+  "message": "Ensure that the default position when loading the chat tab is the bottom most position.",
+  "status": "succeeded",
+  "jobId": "03O5KT",
+  "parentTurnCode": null,
+  "createdAt": "2026-04-10T00:13:18.914Z",
+  "updatedAt": "2026-04-10T00:18:35.131Z",
+  "finishedAt": "2026-04-10T00:18:35.131Z",
+  "error": null
+}

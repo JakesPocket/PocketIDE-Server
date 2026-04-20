@@ -1,0 +1,14 @@
+{
+  "turnCode": "WYUAJ2",
+  "type": "chat",
+  "provider": "copilot",
+  "aiMode": "agent",
+  "message": "Add a button on the settingsview that restart the server and frontend. A separate button for each and on for both",
+  "status": "cancelled",
+  "jobId": null,
+  "parentTurnCode": null,
+  "createdAt": "2026-04-08T02:34:32.148Z",
+  "updatedAt": "2026-04-08T02:35:35.247Z",
+  "finishedAt": "2026-04-08T02:35:35.247Z",
+  "error": null
+}

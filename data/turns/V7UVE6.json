@@ -1,0 +1,14 @@
+{
+  "turnCode": "V7UVE6",
+  "type": "follow-up",
+  "provider": "copilot",
+  "aiMode": "agent",
+  "message": "[Follow-up on task 2295QZ]\n\nWhat files control and manage the ai turns",
+  "status": "succeeded",
+  "jobId": "V7UVE6",
+  "parentTurnCode": "2295QZ",
+  "createdAt": "2026-04-08T05:06:54.947Z",
+  "updatedAt": "2026-04-08T05:08:39.726Z",
+  "finishedAt": "2026-04-08T05:08:39.726Z",
+  "error": null
+}

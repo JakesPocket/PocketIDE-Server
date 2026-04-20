@@ -1,0 +1,14 @@
+{
+  "turnCode": "2295QZ",
+  "type": "task",
+  "provider": "copilot",
+  "aiMode": "agent",
+  "message": "List the files in the src directory",
+  "status": "succeeded",
+  "jobId": "2295QZ",
+  "parentTurnCode": null,
+  "createdAt": "2026-04-08T03:19:30.291Z",
+  "updatedAt": "2026-04-08T03:19:40.636Z",
+  "finishedAt": "2026-04-08T03:19:40.636Z",
+  "error": null
+}
